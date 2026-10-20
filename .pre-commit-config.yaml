@@ -1,0 +1,36 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --no-sync ruff check --fix
+        language: system
+        types_or: [python, pyi]
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --no-sync ruff format
+        language: system
+        types_or: [python, pyi]
+
+      - id: ty-check
+        name: ty check
+        entry: uv run --no-sync ty check src tests
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+
+      - id: pytest-benchmarks
+        name: pytest & performance benchmarks
+        entry: uv run --no-sync pytest
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+        always_run: true
+
+      - id: zensical-build
+        name: zensical docs build
+        entry: uv run --no-sync zensical build --clean
+        language: system
+        files: ^(docs/|src/|tests/test_benchmarks\.py|zensical\.toml)$
+        pass_filenames: false

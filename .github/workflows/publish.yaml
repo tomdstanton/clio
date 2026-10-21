@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/clio
+      url: https://pypi.org/p/pyclio
 
     steps:
       - name: Checkout repository

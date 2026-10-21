@@ -16,6 +16,7 @@
 - **Automatic Docstring-to-CLI Wiring**: [`DocstringParser`](reference.md#clio.docstr.DocstringParser) extracts Google and NumPy parameter descriptions, type annotations, and defaults, automatically populating `argparse` flags and help text.
 - **Package Metadata Auto-Discovery**: [`Cli.from_package()`](reference.md#clio.cli.Cli.from_package) reads `pyproject.toml` / `importlib.metadata` for version, summary, author, and URLs.
 - **Zero-Dependency Markdown Reference Generator**: Render complete CLI documentation with [`Cli.to_markdown()`](reference.md#clio.cli.Cli.to_markdown).
+- **Agent-Native Schema, Tool, Skill & MCP Support**: Export JSON Schemas ([`to_json_schema()`](reference.md#clio.cli.Cli.to_json_schema)), LLM/MCP tool definitions ([`to_tools()`](reference.md#clio.cli.Cli.to_tools)), Agent [`SKILL.md`](reference.md#clio.cli.Cli.to_skill_md) files, structured `--json` / `--dry-run` execution envelopes ([`AgentResult`](reference.md#clio.agent.AgentResult)), token-efficient `CLIO_AGENT=1` error diagnostics, and a zero-dependency stdio MCP server ([`McpServer`](reference.md#clio.agent.McpServer)).
 
 ---
 

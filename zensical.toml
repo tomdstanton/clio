@@ -1,94 +1,84 @@
 [project]
-site_url = "https://tomdstanton.github.io/clio/"
-site_name = "clio"
+site_name = "clio Docs"
 site_description = "Lightweight, zero-dependency, object-oriented CLI framework built on argparse."
+site_url = "https://tomdstanton.github.io/clio/"
 site_author = "Tom Stanton"
 repo_url = "https://github.com/tomdstanton/clio"
 repo_name = "tomdstanton/clio"
-edit_uri = "edit/master/docs/"
+edit_uri = "edit/main/docs/"
+language = "en"
+copyright = """
+Copyright &copy; 2026 <a href="https://tomdstanton.com" target="_blank">Tom Stanton</a>
+"""
+docs_dir = "docs"
+site_dir = "site"
+watch = ["src"]
 
 nav = [
-  { "Overview" = "index.md" },
-  { "Performance Benchmarks" = "benchmarks.md" },
-  { "API Reference" = "reference.md" },
+    { Overview = "index.md" },
+    { "Performance Benchmarks" = "benchmarks.md" },
+    { "API Reference" = "reference.md" },
+]
+
+plugins = [
+    "search",
+    { reading-time = { words_per_minute = 200 } },
+    "include-markdown",
+    "offline",
+    { mkdocstrings = { handlers = { python = { paths = ["src"], inventories = ["https://docs.python.org/3/objects.inv"], options = { docstring_style = "google", docstring_section_style = "list", relative_crossrefs = true, scoped_crossrefs = true, signature_crossrefs = true, unwrap_annotated = true, filters = "public", inherited_members = true, summary = true, heading_level = 2, parameter_headings = true, type_parameter_headings = true, show_root_heading = false, show_root_full_path = false, show_symbol_type_heading = true, show_symbol_type_toc = true, line_length = 88, merge_init_into_class = true, separate_signature = true, show_signature_annotations = true, show_signature_type_parameters = true, backlinks = "tree", show_bases = false, show_inheritance_diagram = true, docstring_options = { ignore_init_summary = true } } } } } }
 ]
 
 [project.theme]
-language = "en"
-features = [
-  "announce.dismiss",
-  "content.code.annotate",
-  "content.code.copy",
-  "content.code.select",
-  "content.footnote.tooltips",
-  "content.tabs.link",
-  "content.tooltips",
-  "navigation.footer",
-  "navigation.indexes",
-  "navigation.instant",
-  "navigation.instant.prefetch",
-  "navigation.path",
-  "navigation.sections",
-  "navigation.top",
-  "navigation.tracking",
-  "search.highlight",
+name = "material"
+icon.repo = "fontawesome/brands/github"
+
+palette = [
+    { media = "(prefers-color-scheme)", toggle = { icon = "lucide/sun-moon", name = "Switch to light mode" } },
+    { media = "(prefers-color-scheme: light)", scheme = "default", toggle = { icon = "lucide/sun", name = "Switch to dark mode" }, primary = "purple", accent = "purple" },
+    { media = "(prefers-color-scheme: dark)", scheme = "slate", toggle = { icon = "lucide/moon", name = "Switch to system preference" }, primary = "purple", accent = "purple" }
 ]
 
-[[project.theme.palette]]
-media = "(prefers-color-scheme)"
-toggle.icon = "lucide/sun-moon"
-toggle.name = "Switch to light mode"
+features = [
+    "announce.dismiss",
+    "content.action.edit",
+    "content.code.annotate",
+    "content.code.copy",
+    "content.code.select",
+    "content.footnote.tooltips",
+    "header.autohide",
+    "navigation.top",
+    "navigation.footer",
+    "navigation.tabs",
+    "navigation.tabs.sticky",
+    "navigation.tracking",
+    "navigation.instant",
+    "navigation.instant.progress",
+    "navigation.path",
+    "search.suggest",
+    "search.highlight",
+    "search.share",
+    "toc.follow",
+]
 
-[[project.theme.palette]]
-media = "(prefers-color-scheme: light)"
-scheme = "default"
-toggle.icon = "lucide/sun"
-toggle.name = "Switch to dark mode"
-
-[[project.theme.palette]]
-media = "(prefers-color-scheme: dark)"
-scheme = "slate"
-toggle.icon = "lucide/moon"
-toggle.name = "Switch to system preference"
-
-[project.plugins.mkdocstrings.handlers.python]
-paths = ["src"]
-
-[project.plugins.mkdocstrings.handlers.python.options]
-docstring_style = "google"
-show_source = true
-show_root_heading = true
-show_symbol_type_heading = true
-show_symbol_type_toc = true
-signature_crossrefs = true
-separate_signature = true
+[project.extra]
+social = [
+    { icon = "lucide/mail", link = "mailto:tomdstanton@gmail.com" },
+    { icon = "simple/pypi", link = "https://pypi.org/project/clio" },
+    { icon = "lucide/book-open-text", link = "https://tomdstanton.github.io/clio/" },
+]
+generator = false
 
 [project.markdown_extensions]
-abbr = {}
 admonition = {}
 attr_list = {}
-def_list = {}
 footnotes = {}
 md_in_html = {}
-toc.permalink = true
-pymdownx.arithmatex.generic = true
-pymdownx.betterem = {}
-pymdownx.caret = {}
-pymdownx.details = {}
-pymdownx.emoji.emoji_generator = "zensical.extensions.emoji.to_svg"
-pymdownx.emoji.emoji_index = "zensical.extensions.emoji.twemoji"
-pymdownx.highlight.anchor_linenums = true
-pymdownx.highlight.line_spans = "__span"
-pymdownx.highlight.pygments_lang_class = true
-pymdownx.inlinehilite = {}
-pymdownx.keys = {}
-pymdownx.magiclink = {}
-pymdownx.mark = {}
-pymdownx.smartsymbols = {}
-pymdownx.superfences.custom_fences = [
-  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
-]
-pymdownx.tabbed.alternate_style = true
-pymdownx.tabbed.combine_header_slug = true
-pymdownx.tasklist.custom_checkbox = true
-pymdownx.tilde = {}
+toc = { permalink = true, title = "On this page" }
+
+"pymdownx.details" = {}
+"pymdownx.emoji" = { emoji_index = "zensical.extensions.emoji.twemoji", emoji_generator = "zensical.extensions.emoji.to_svg" }
+"pymdownx.highlight" = { anchor_linenums = true, use_pygments = true }
+"pymdownx.inlinehilite" = {}
+"pymdownx.snippets" = { base_path = ["."] }
+"pymdownx.superfences" = { custom_fences = [ { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" } ] }
+"pymdownx.tabbed" = { alternate_style = true }

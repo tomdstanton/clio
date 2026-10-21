@@ -31,3 +31,9 @@ Complete API reference for `clio`, rendered via `mkdocstrings[python]`.
 ## ANSI Colors & Help Formatting (`clio.color`)
 
 ::: clio.color
+
+---
+
+## Agentic Coding & MCP (`clio.agent`)
+
+::: clio.agent

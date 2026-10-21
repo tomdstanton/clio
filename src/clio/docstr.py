@@ -1,6 +1,7 @@
 import annotationlib
 import argparse
 import dataclasses
+import enum
 import inspect
 import os
 import re
@@ -12,6 +13,8 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from inspect import Parameter, Signature, _ParameterKind
 from typing import Annotated, Any, ClassVar, Literal, Self, Union, get_args, get_origin
+
+from clio.agent import serialize_for_json
 
 
 def _parse_bool(value: str) -> bool:
@@ -274,6 +277,167 @@ class ParameterSpec:
         if not self.is_positional and len(flags) > 1:
             kwargs["dest"] = self.name
         return flags, kwargs
+
+    @property
+    def is_required(self) -> bool:
+        r"""Whether this parameter is required when invoking the command."""
+        if self.has_default:
+            return False
+        if self.arg_meta is not None and self.arg_meta.env and self.arg_meta.env in os.environ:
+            return False
+        return True
+
+    @classmethod
+    def _annotation_to_json_schema(cls, ann: Any) -> dict[str, Any]:
+        r"""Map a resolved Python type annotation to a JSON Schema property fragment."""
+        if ann is inspect.Parameter.empty or ann in (Any, object) or isinstance(ann, ForwardRef):
+            return {"type": "string"}
+
+        origin = get_origin(ann)
+        if origin is Annotated:
+            return cls._annotation_to_json_schema(get_args(ann)[0])
+
+        if origin in (types.UnionType, Union):
+            non_none = [a for a in get_args(ann) if a is not type(None)]
+            if len(non_none) == 1:
+                return cls._annotation_to_json_schema(non_none[0])
+            return {"anyOf": [cls._annotation_to_json_schema(a) for a in non_none]}
+
+        if origin is Literal:
+            choices = list(get_args(ann))
+            schema: dict[str, Any] = {"enum": [serialize_for_json(c) for c in choices]}
+            choice_types = {type(c) for c in choices}
+            if len(choice_types) == 1:
+                only_type = next(iter(choice_types))
+                type_schema = cls._annotation_to_json_schema(only_type)
+                if "type" in type_schema:
+                    schema["type"] = type_schema["type"]
+            return schema
+
+        if origin in (list, tuple, set, Sequence, Iterable, AbstractSet) or ann in (list, tuple, set):
+            item_args = get_args(ann)
+            items_schema = cls._annotation_to_json_schema(item_args[0]) if item_args else {"type": "string"}
+            return {"type": "array", "items": items_schema}
+
+        if origin in (dict, Mapping) or ann in (dict, Mapping):
+            return {"type": "object"}
+
+        if ann is bool:
+            return {"type": "boolean"}
+        if ann is int:
+            return {"type": "integer"}
+        if ann is float:
+            return {"type": "number"}
+        if ann is str:
+            return {"type": "string"}
+        if isinstance(ann, type):
+            if issubclass(ann, os.PathLike):
+                return {"type": "string", "format": "path"}
+            if issubclass(ann, enum.Enum):
+                return {"type": "string", "enum": [serialize_for_json(e.value) for e in ann]}
+
+        return {"type": "string"}
+
+    def to_json_schema(self) -> dict[str, Any]:
+        r"""Compile parameter specification into a JSON Schema property definition.
+
+        Includes `description`, `default`, `enum` choices, and `x-clio-*` CLI binding metadata.
+
+        Returns:
+            dict[str, Any]: JSON Schema property dictionary for this parameter.
+        """
+        schema = self._annotation_to_json_schema(self.annotation)
+        meta = self.arg_meta
+
+        if meta is not None and meta.choices is not None:
+            schema["enum"] = [serialize_for_json(c) for c in meta.choices]
+
+        if self.docstring:
+            schema["description"] = self.docstring
+
+        if self.has_default and self.default is not None:
+            schema["default"] = serialize_for_json(self.default)
+
+        if self.is_positional:
+            schema["x-clio-positional"] = True
+        else:
+            schema["x-clio-flags"] = list(self.option_flags)
+
+        if meta is not None and meta.env:
+            schema["x-clio-env"] = meta.env
+
+        return schema
+
+    def coerce_value(self, value: Any) -> Any:
+        r"""Validate and coerce a raw JSON or Python value into the parameter's annotated type.
+
+        Args:
+            value (Any): Raw input value (e.g. from MCP `tools/call` or programmatic invocation).
+
+        Returns:
+            Any: Coerced Python value matching `self.annotation`.
+
+        Raises:
+            ValueError: If `value` violates allowed choices or cannot be converted.
+        """
+        if value is None:
+            return None
+
+        ann = self.annotation
+        origin = get_origin(ann)
+        meta = self.arg_meta
+
+        allowed_choices: list[Any] | None = None
+        if meta is not None and meta.choices is not None:
+            allowed_choices = list(meta.choices)
+        elif origin is Literal:
+            allowed_choices = list(get_args(ann))
+
+        if ann is bool:
+            coerced: Any = value if isinstance(value, bool) else _parse_bool(str(value))
+        elif origin in (list, tuple, set, Sequence, Iterable, AbstractSet) or ann in (list, tuple, set):
+            raw_items = [p.strip() for p in value.split(",") if p.strip()] if isinstance(value, str) else list(value)
+            item_args = get_args(ann)
+            item_choices: list[Any] | None = None
+            if item_args:
+                item_ann = item_args[0]
+                if get_origin(item_ann) is Literal:
+                    item_choices = list(get_args(item_ann))
+                    if item_choices and len({type(c) for c in item_choices}) == 1:
+                        item_type = type(item_choices[0])
+                        raw_items = [item if isinstance(item, item_type) else item_type(item) for item in raw_items]
+                elif item_ann not in (Any, object) and not isinstance(item_ann, ForwardRef) and callable(item_ann):
+                    raw_items = [item if isinstance(item, item_ann) else item_ann(item) for item in raw_items]
+            if item_choices is not None:
+                for item in raw_items:
+                    if item not in item_choices:
+                        raise ValueError(f"Invalid choice {item!r} for '{self.name}' (choose from {item_choices})")
+            if origin is tuple or ann is tuple:
+                coerced = tuple(raw_items)
+            elif origin in (set, AbstractSet) or ann is set:
+                coerced = set(raw_items)
+            else:
+                coerced = list(raw_items)
+        elif origin is Literal:
+            if allowed_choices and len({type(c) for c in allowed_choices}) == 1:
+                target_type = type(allowed_choices[0])
+                coerced = value if isinstance(value, target_type) else target_type(value)
+            else:
+                coerced = value
+        elif (
+            ann not in (inspect.Parameter.empty, Any, object)
+            and origin is None
+            and not isinstance(ann, ForwardRef)
+            and callable(ann)
+        ):
+            coerced = value if isinstance(value, ann) else ann(value)
+        else:
+            coerced = value
+
+        if allowed_choices is not None and coerced not in allowed_choices:
+            raise ValueError(f"Invalid choice {coerced!r} for '{self.name}' (choose from {allowed_choices})")
+
+        return coerced
 
 
 @dataclass(frozen=True, slots=True)

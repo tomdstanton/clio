@@ -1,3 +1,11 @@
+from clio.agent import (
+    AgentErrorSpec,
+    AgentMessage,
+    AgentResult,
+    McpServer,
+    ToolSpec,
+    serialize_for_json,
+)
 from clio.cli import Cli, CliConfig, CliError, HelpOnErrorParser, PackageMeta
 from clio.color import ColorHelpFormatter, Colors, Style
 from clio.command import (
@@ -12,6 +20,9 @@ from clio.command import (
 from clio.docstr import Arg, DocstringParser, DocstringSpec, ParameterSpec
 
 __all__ = [
+    "AgentErrorSpec",
+    "AgentMessage",
+    "AgentResult",
     "Arg",
     "BaseCommand",
     "CallPlan",
@@ -28,7 +39,10 @@ __all__ = [
     "DocstringParser",
     "DocstringSpec",
     "HelpOnErrorParser",
+    "McpServer",
     "PackageMeta",
     "ParameterSpec",
     "Style",
+    "ToolSpec",
+    "serialize_for_json",
 ]

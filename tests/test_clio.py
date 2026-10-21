@@ -1,6 +1,8 @@
 r"""Comprehensive test suite for the cliop CLI library."""
 
 import argparse
+import io
+import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,6 +17,9 @@ if TYPE_CHECKING:
 
 
 from clio import (
+    AgentErrorSpec,
+    AgentMessage,
+    AgentResult,
     Arg,
     BaseCommand,
     CallPlan,
@@ -28,9 +33,11 @@ from clio import (
     DocstringParser,
     DocstringSpec,
     HelpOnErrorParser,
+    McpServer,
     PackageMeta,
     ParameterSpec,
     Style,
+    ToolSpec,
 )
 
 
@@ -779,3 +786,488 @@ def test_annotationlib_annotated_arg_metadata_and_forwardref_resilience(
     assert "Docstring fallback description for workers." in md
     assert "Auth token" in md
     assert "Bind hostname" in md
+
+
+# 7. Agentic Coding, Schema, SKILL.md, Dry-Run & MCP Tests -------------------------------------------------------------
+def test_schema_tool_and_skill_generation() -> None:
+    class DeployCommand(Command):
+        """Deploy service to target environment.
+
+        Args:
+            target: Path to deployment manifest.
+            env: Target environment name.
+            replicas: Number of replicas to provision.
+        """
+
+        name = "deploy"
+        aliases = ["dp"]
+
+        def __call__(
+            self,
+            target: Path,
+            env: Literal["staging", "prod"] = "staging",
+            replicas: Annotated[int, Arg(short="-r", env="DEPLOY_REPLICAS")] = 2,
+        ) -> dict[str, Any]:
+            return {"target": target, "env": env, "replicas": replicas}
+
+    cli = Cli(
+        prog="cloudctl",
+        description="Cloud control plane CLI.",
+        version="2.0.0",
+        commands=[DeployCommand, ParentBranchCommand],
+        enable_agent_flags=True,
+    )
+
+    schema = cli.to_json_schema()
+    assert schema["prog"] == "cloudctl"
+    assert schema["version"] == "2.0.0"
+    assert "deploy" in schema["commands"]
+    assert "branch" in schema["commands"]
+
+    deploy_schema = schema["commands"]["deploy"]
+    assert deploy_schema["required"] == ["target"]
+    assert deploy_schema["properties"]["target"]["format"] == "path"
+    assert deploy_schema["properties"]["env"]["enum"] == ["staging", "prod"]
+    assert deploy_schema["properties"]["replicas"]["type"] == "integer"
+    assert deploy_schema["properties"]["replicas"]["x-clio-env"] == "DEPLOY_REPLICAS"
+    assert "-r" in deploy_schema["properties"]["replicas"]["x-clio-flags"]
+
+    tools = cli.to_tools()
+    tool_names = [t.name for t in tools]
+    assert tool_names == ["deploy", "branch_leafcommand"]
+    assert isinstance(tools[0], ToolSpec)
+    assert tools[0].to_openai_tool()["type"] == "function"
+
+    skill_md = cli.to_skill_md()
+    assert skill_md.startswith("---\nname: cloudctl\n")
+    assert "CLIO_AGENT=1" in skill_md
+    assert "--json" in skill_md
+    assert "--dry-run" in skill_md
+    assert "--mcp" in skill_md
+
+
+def test_clio_agent_env_mode_concise_errors_and_no_spinners(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Colors, "ENABLED", False)
+    monkeypatch.setenv("CLIO_AGENT", "1")
+
+    class WorkCommand(Command):
+        """Run work items."""
+
+        name = "work"
+
+        def __call__(self, count: int = 2) -> None:
+            assert self.cli is not None
+            for _ in self.cli.progress(range(count), "Working"):
+                pass
+
+    cli = Cli(prog="agenttool", commands=[WorkCommand])
+    assert cli.agent_mode is True
+
+    # 1. Typo in flag produces fuzzy suggestion and concise error (without full help dump)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.run(["work", "--coun", "5"])
+    assert exc_info.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "Did you mean '--count'?" in stderr
+    assert "Run 'agenttool work --help' for full help." in stderr
+    assert "🌎 Global options" not in stderr
+
+    # 2. Progress in verbose agent mode emits a single summary line without \r frames
+    cli.run(["-V", "work", "--count", "3"])
+    stderr_progress = capsys.readouterr().err
+    assert "Working (3)" in stderr_progress
+    assert "\r" not in stderr_progress
+
+
+def test_opt_in_agent_flags_json_dry_run_and_introspection(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Colors, "ENABLED", False)
+    executed: list[Any] = []
+
+    @dataclass(frozen=True, slots=True)
+    class BuildResult:
+        artifact: Path
+        replicas: int
+
+    class BuildCommand(Command):
+        """Build an artifact."""
+
+        name = "build"
+
+        def __call__(self, target: Path, *, replicas: int = 2, fail: bool = False) -> BuildResult:
+            assert self.cli is not None
+            self.cli.msg("Starting build")
+            print("build-stdout-line")
+            if fail:
+                raise CliError("Build failed cleanly", exit_code=9)
+            executed.append((target, replicas))
+            return BuildResult(artifact=target, replicas=replicas)
+
+    cli = Cli(prog="builder", version="1.0.0", commands=[BuildCommand], enable_agent_flags=True)
+
+    # 1. --dry-run resolves CallPlan bindings without running BuildCommand.__call__
+    dry_res = cli.run(["build", "dist/app.whl", "--replicas", "4", "--dry-run"])
+    assert isinstance(dry_res, AgentResult)
+    assert dry_res.ok is True
+    assert dry_res.dry_run is True
+    assert executed == []
+    dry_payload = json.loads(capsys.readouterr().out)
+    assert dry_payload["dry_run"] is True
+    assert dry_payload["arguments"] == {"target": "dist/app.whl", "replicas": 4, "fail": False}
+
+    # 2. --json wraps return value and captures stdout + verbose cli.msg
+    ok_res = cli.run(["-V", "build", "dist/app.whl", "--replicas", "3", "--json"])
+    assert isinstance(ok_res, AgentResult)
+    assert len(executed) == 1
+    ok_payload = json.loads(capsys.readouterr().out)
+    assert ok_payload["ok"] is True
+    assert ok_payload["command"] == "build"
+    assert ok_payload["result"] == {"artifact": "dist/app.whl", "replicas": 3}
+    assert {"level": "info", "text": "Starting build"} in ok_payload["messages"]
+    assert {"level": "stdout", "text": "build-stdout-line"} in ok_payload["messages"]
+
+    assert ok_res.messages[0] == AgentMessage(level="info", text="Starting build")
+    assert ok_res.error is None
+    err_spec = AgentErrorSpec(message="Build failed cleanly", exit_code=9)
+    assert err_spec.to_dict() == {"message": "Build failed cleanly", "exit_code": 9}
+
+    # 3. --json on CliError emits structured error envelope and exits with custom code
+    with pytest.raises(SystemExit) as exc_info:
+        cli.run(["build", "dist/app.whl", "--fail", "--json"])
+    assert exc_info.value.code == 9
+    err_payload = json.loads(capsys.readouterr().out)
+    assert err_payload["ok"] is False
+    assert err_payload["error"]["message"] == "Build failed cleanly"
+    assert err_payload["error"]["exit_code"] == 9
+
+    # 4. --schema and --skill flags exit 0 with structured output
+    with pytest.raises(SystemExit) as exc_info:
+        cli.run(["--schema"])
+    assert exc_info.value.code == 0
+    schema_out = json.loads(capsys.readouterr().out)
+    assert schema_out["prog"] == "builder"
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.run(["build", "--skill"])
+    assert exc_info.value.code == 0
+    assert "name: builder-build" in capsys.readouterr().out
+
+
+def test_mcp_server_json_rpc_lifecycle() -> None:
+    @dataclass(frozen=True, slots=True)
+    class SumTask:
+        """Add two integers.
+
+        Attributes:
+            a: First number.
+            b: Second number.
+        """
+
+        name: str = field(default="sum", init=False)
+        a: int
+        b: int = 10
+
+        def __call__(self) -> dict[str, int]:
+            return {"total": self.a + self.b}
+
+    cli = Cli(prog="calc", version="0.2.0", commands=[SumTask, ParentBranchCommand])
+    server = McpServer(cli)
+
+    # 1. initialize, tools/list, tools/call via stdio stream
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "sum", "arguments": {"a": 32, "b": 10}},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "branch_leafcommand", "arguments": {"name": "agent"}},
+        },
+    ]
+    in_stream = io.StringIO("\n".join(json.dumps(r) for r in requests) + "\n")
+    out_stream = io.StringIO()
+
+    server.serve(stdin=in_stream, stdout=out_stream)
+    responses = [json.loads(line) for line in out_stream.getvalue().splitlines() if line.strip()]
+
+    assert len(responses) == 4  # Notification produces no response
+    assert responses[0]["result"]["serverInfo"]["name"] == "calc"
+    listed_names = [t["name"] for t in responses[1]["result"]["tools"]]
+    assert listed_names == ["sum", "branch_leafcommand"]
+
+    sum_res = responses[2]["result"]
+    assert sum_res["isError"] is False
+    assert sum_res["structuredContent"]["result"] == {"total": 42}
+
+    leaf_res = responses[3]["result"]
+    assert leaf_res["isError"] is False
+    assert {"level": "stdout", "text": "Hello, agent!"} in leaf_res["structuredContent"]["messages"]
+
+
+def test_extended_coverage_color_docstr_command_agent_and_cli(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import enum
+    import inspect
+
+    from clio.agent import serialize_for_json
+    from clio.color import _detect_color_support
+    from clio.docstr import _parse_bool
+
+    # 1. Color environment detection & style branches
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert _detect_color_support() is False
+    monkeypatch.delenv("NO_COLOR")
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    assert _detect_color_support() is True
+    monkeypatch.delenv("FORCE_COLOR")
+    monkeypatch.setenv("TERM", "dumb")
+    assert _detect_color_support() is False
+    monkeypatch.delenv("TERM")
+    assert isinstance(_detect_color_support(), bool)
+
+    monkeypatch.setattr(Colors, "ENABLED", True)
+    full_style = Style(
+        fg=Colors.RED,
+        bg=Colors.BG_BLUE,
+        bold=True,
+        dim=True,
+        italic=True,
+        underline=True,
+        blink=True,
+        reverse=True,
+        hidden=True,
+        strikethrough=True,
+    )
+    assert full_style("x").startswith("\033[")
+    assert full_style("") == ""
+    assert Colors.wrap("x", "") == "x"
+    assert Colors.style("x") == "x"
+    assert Colors.style(
+        "x",
+        fg=Colors.RED,
+        bg=Colors.BG_BLACK,
+        bold=True,
+        dim=True,
+        italic=True,
+        underline=True,
+        blink=True,
+        reverse=True,
+        hidden=True,
+        strikethrough=True,
+    ).startswith("\033[")
+    assert Colors.black("b") != "b"
+    assert Colors.black("b", bold=True) != "b"
+    assert Colors.green("g") != "g"
+    assert Colors.yellow("y", bold=True) != "y"
+    assert Colors.blue("bl", bold=True) != "bl"
+    assert Colors.magenta("m", bold=True) != "m"
+    assert Colors.cyan("c") != "c"
+    assert Colors.white("w", bold=True) != "w"
+    assert Colors.gray("gr", bold=True) != "gr"
+    with pytest.raises(ValueError, match="256-color"):
+        Colors.bg256(-1)
+    with pytest.raises(ValueError, match="Invalid hex"):
+        Colors.hex("#12345")
+
+    # 2. _parse_bool & serialize_for_json & ParameterSpec coercion / schema
+    assert _parse_bool("yes") is True
+    assert _parse_bool("off") is False
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_bool("maybe")
+
+    class ColorEnum(enum.Enum):
+        RED = "red"
+        BLUE = "blue"
+
+    class CustomDictObj:
+        def to_dict(self) -> dict[str, Any]:
+            return {"nested": ColorEnum.RED}
+
+    class CustomFallbackObj:
+        def __str__(self) -> str:
+            return "custom-fallback"
+
+    assert serialize_for_json(ColorEnum.BLUE) == "blue"
+    assert serialize_for_json({"k": (1, 2)}) == {"k": [1, 2]}
+    assert serialize_for_json(CustomDictObj()) == {"nested": "red"}
+    assert serialize_for_json(CustomFallbackObj()) == "custom-fallback"
+
+    a1 = Arg(short="-a", help="first")
+    a2 = Arg(short=("-a", "--alpha"), metavar="A", choices=("x", "y"), env="ENV_A", positional=False)
+    merged_arg = a1.merge(a2)
+    assert merged_arg.short_flags == ("-a", "--alpha")
+    assert merged_arg.metavar == "A"
+
+    p_empty = ParameterSpec(name="raw", annotation=argparse.Namespace)
+    assert p_empty.type_label == "argparse.Namespace"
+    assert ParameterSpec(name="untyped", annotation=inspect.Parameter.empty).type_label == "str"
+    _, kwargs_pos_default = ParameterSpec(
+        name="opt_pos", annotation=bool, default=True, arg_meta=Arg(positional=True)
+    ).to_argparse()
+    assert kwargs_pos_default["nargs"] == "?"
+
+    # Coerce value & schema branches
+    p_bool = ParameterSpec(name="flag", annotation=bool, default=False)
+    assert p_bool._coerce_env_value("true") is True
+    assert p_bool.coerce_value("1") is True
+    assert p_bool.coerce_value(None) is None
+
+    p_list_int = ParameterSpec(name="nums", annotation=list[int])
+    assert p_list_int._coerce_env_value("1, 2, 3") == [1, 2, 3]
+    assert p_list_int.coerce_value("4,5") == [4, 5]
+
+    p_list_lit = ParameterSpec(name="modes", annotation=list[Literal["a", "b"]])
+    assert p_list_lit.coerce_value("a,b") == ["a", "b"]
+    with pytest.raises(ValueError, match="Invalid choice"):
+        p_list_lit.coerce_value(["a", "c"])
+
+    p_tuple = ParameterSpec(name="tup", annotation=tuple[int, ...])
+    assert p_tuple.coerce_value([1, "2"]) == (1, 2)
+
+    p_set = ParameterSpec(name="st", annotation=set[str])
+    assert p_set.coerce_value("x,y") == {"x", "y"}
+
+    p_lit = ParameterSpec(name="lit", annotation=Literal[1, 2])
+    assert p_lit.coerce_value("2") == 2
+    with pytest.raises(ValueError, match="Invalid choice"):
+        p_lit.coerce_value("9")
+
+    assert ParameterSpec._annotation_to_json_schema(int | str) == {"anyOf": [{"type": "integer"}, {"type": "string"}]}
+    assert ParameterSpec._annotation_to_json_schema(dict[str, int]) == {"type": "object"}
+    assert ParameterSpec._annotation_to_json_schema(float) == {"type": "number"}
+    assert ParameterSpec._annotation_to_json_schema(ColorEnum) == {"type": "string", "enum": ["red", "blue"]}
+    assert DocstringParser._unwrap_optional(int | None) == (int, True)
+    DocstringParser.clear_cache()
+
+    # 3. Imperative setup_arguments introspection, invoke_with_arguments, and CallPlan branches
+    @dataclass
+    class PosCfg:
+        host: str = "localhost"
+
+    class ImperativeCmd(Command):
+        """Imperative command."""
+
+        name = "imp"
+
+        def setup_arguments(self) -> None:
+            assert self.parser is not None
+            self.parser.add_argument("target", help="Target name")
+            self.parser.add_argument("-f", "--flag", action="store_true", help="Bool flag")
+            self.parser.add_argument("--items", nargs="+", type=int, default=[1], help="Int items")
+            self.parser.add_argument("--mode", choices=["fast", "slow"], default="fast", help="Mode")
+
+        def __call__(
+            self,
+            ns: argparse.Namespace,
+            cfg: PosCfg,
+            /,
+            *,
+            extra_ns: argparse.Namespace,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            if self.cli is not None:
+                for _ in self.cli.progress([1, 2], "Iterating"):
+                    pass
+            print("err-line", file=sys.stderr)
+            return {"host": cfg.host, "target": ns.target, "extra": extra_ns.mode, "kw": kwargs}
+
+    imp_cmd = ImperativeCmd()
+    specs = imp_cmd.get_parameter_specs()
+    assert any(s.name == "target" for s in specs)
+    assert imp_cmd.invoke_with_arguments({"target": "app", "flag": True})["target"] == "app"
+
+    with pytest.raises(ValueError, match="cannot be null"):
+        imp_cmd.invoke_with_arguments({"target": None})
+    with pytest.raises(ValueError, match="Missing required argument"):
+        imp_cmd.invoke_with_arguments({})
+    with pytest.raises(TypeError, match="not executable"):
+        ParentBranchCommand().invoke_with_arguments({})
+    with pytest.raises(TypeError, match="Expected a BaseCommand"):
+        Cli(prog="bad", commands=[123])  # type: ignore[list-item]
+    with pytest.raises(TypeError, match="Expected a @dataclass"):
+        Command.from_dataclass(int)
+    with pytest.raises(TypeError, match="must either define '__call__'"):
+        Command.from_dataclass(PosCfg)
+
+    # 4. Custom Cli subclass, --json parser error, --help-md, --schema on subcommand, and MCP error branches
+    class CustomCli(Cli):
+        """Custom CLI subclass docstring."""
+
+    app = CustomCli(prog="custom", version="0.1.0", commands=[imp_cmd], enable_agent_flags=True)
+    assert app.config.description == "Custom CLI subclass docstring."
+
+    dry_imp = app.run(["imp", "my-target", "--dry-run"])
+    assert dry_imp.dry_run is True
+    capsys.readouterr()
+
+    json_imp = app.run(["-V", "imp", "my-target", "--json"])
+    assert json_imp.ok is True
+    assert any(m.level == "stderr" and m.text == "err-line" for m in json_imp.messages)
+    assert any(m.level == "info" and "Iterating (2)" in m.text for m in json_imp.messages)
+    capsys.readouterr()
+
+    # Parser error with --json emits structured JSON error envelope
+    with pytest.raises(SystemExit) as exc_info:
+        app.run(["imp", "my-target", "--mod", "fast", "--json"])
+    assert exc_info.value.code == 2
+    err_json = json.loads(capsys.readouterr().out)
+    assert err_json["ok"] is False
+    assert "--mode" in err_json["error"]["suggestions"]
+
+    # --help-md and subcommand --schema / --skill
+    with pytest.raises(SystemExit):
+        app.run(["--help-md"])
+    assert "# `custom`" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit):
+        app.run(["imp", "--help-md"])
+    assert "## `custom imp`" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit):
+        app.run(["imp", "--schema"])
+    assert json.loads(capsys.readouterr().out)["title"] == "imp"
+
+    with pytest.raises(SystemExit):
+        app.run(["--skill"])
+    assert "name: custom" in capsys.readouterr().out
+
+    # MCP error handling branches (parse error, invalid request, ping, unknown method, invalid params, unknown tool)
+    mcp_lines = [
+        "",
+        "{invalid-json",
+        "[1, 2, 3]",
+        json.dumps({"jsonrpc": "2.0", "id": 10, "method": "ping"}),
+        json.dumps({"jsonrpc": "2.0", "id": 11, "method": "unknown/method"}),
+        json.dumps({"jsonrpc": "2.0", "id": 12, "method": "tools/call", "params": {}}),
+        json.dumps({"jsonrpc": "2.0", "id": 13, "method": "tools/call", "params": {"name": "imp", "arguments": "bad"}}),
+        json.dumps(
+            {"jsonrpc": "2.0", "id": 14, "method": "tools/call", "params": {"name": "no_such_tool", "arguments": {}}}
+        ),
+        json.dumps({"jsonrpc": "2.0", "id": 15, "method": "tools/call", "params": {"name": "imp", "arguments": {}}}),
+    ]
+    mcp_in = io.StringIO("\n".join(mcp_lines) + "\n")
+    mcp_out = io.StringIO()
+    app.serve_mcp(stdin=mcp_in, stdout=mcp_out)
+    mcp_resps = [json.loads(line) for line in mcp_out.getvalue().splitlines() if line.strip()]
+    assert mcp_resps[0]["error"]["code"] == -32700
+    assert mcp_resps[1]["error"]["code"] == -32600
+    assert mcp_resps[2]["result"] == {}
+    assert mcp_resps[3]["error"]["code"] == -32601
+    assert mcp_resps[4]["error"]["code"] == -32602
+    assert mcp_resps[5]["error"]["code"] == -32602
+    assert mcp_resps[6]["result"]["isError"] is True
+    assert mcp_resps[7]["result"]["isError"] is True

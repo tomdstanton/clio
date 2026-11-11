@@ -1,8 +1,6 @@
-import argparse
 import os
 import re
 import sys
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import ClassVar, Self
 
@@ -506,84 +504,3 @@ class Colors:
     def muted(cls, text: str) -> str:
         r"""Format text with semantic muted styling (dim)."""
         return cls.wrap(text, cls.DIM)
-
-
-class ColorHelpFormatter(argparse.RawTextHelpFormatter):
-    r"""Custom argparse help formatter adding ANSI colors and layout enhancements.
-
-    Inherits from `argparse.RawTextHelpFormatter` to preserve
-    raw multiline descriptions while adding styled section headings and usage placeholders.
-    """
-
-    _SUBCOMMAND_SET_RE: ClassVar[re.Pattern[str]] = re.compile(r"\{[a-zA-Z0-9_,\.-]+\}")
-
-    def _format_usage(
-        self,
-        usage: str | None,
-        actions: Iterable[argparse.Action],
-        groups: Iterable[argparse._ArgumentGroup],
-        prefix: str | None,
-    ) -> str:
-        r"""Format usage syntax string with ANSI color highlights.
-
-        Args:
-            usage (str | None): Custom usage message pattern.
-            actions (Iterable[argparse.Action]): Sequence of argument actions.
-            groups (Iterable[argparse._ArgumentGroup]): Sequence of argument groups.
-            prefix (str | None): Usage line prefix string (defaults to "usage: ").
-
-        Returns:
-            str: Colorized usage string.
-        """
-        positionals: list[argparse.Action] = []
-        has_optionals = False
-        for action in actions:
-            if action.option_strings:
-                has_optionals = True
-            else:
-                positionals.append(action)
-
-        result = super()._format_usage(usage, positionals, groups, prefix)  # type: ignore
-
-        # Replace the subcommand set {add,install,...} with [subcommand]
-        result = self._SUBCOMMAND_SET_RE.sub(Colors.info("[subcommand]"), result)
-
-        actual_prefix = prefix if prefix is not None else "usage: "
-        target = f"{actual_prefix}{self._prog}"
-
-        if result.startswith(target):
-            # Inject [options] cleanly if any optional actions exist
-            if has_optionals:
-                colored_options = Colors.info("[options]")
-                result = result.replace(target, f"{target} {colored_options}", 1)
-            # Colorize prefix
-            result = result.replace(actual_prefix, Colors.info(actual_prefix), 1)
-
-        return result
-
-    def start_section(self, heading: str | None) -> None:
-        r"""Start a new help output section with a colorized heading.
-
-        Args:
-            heading (str | None): Title heading string for the section.
-        """
-        if heading:
-            heading = Colors.info(heading)
-        super().start_section(heading)
-
-    def _format_action(self, action: argparse.Action) -> str:
-        r"""Format help output text for a single argument action.
-
-        Args:
-            action (argparse.Action): Argument action instance being formatted.
-
-        Returns:
-            str: Formatted action description string.
-        """
-        result = super()._format_action(action)
-        # Remove the set string (e.g. {add,install,...}) from the subcommands header
-        if isinstance(action, argparse._SubParsersAction):
-            lines = result.split("\n", 1)
-            if len(lines) > 1:
-                result = lines[1]
-        return result

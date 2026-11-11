@@ -1,5 +1,4 @@
 import annotationlib
-import argparse
 import dataclasses
 import enum
 import inspect
@@ -12,29 +11,130 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from inspect import Parameter, Signature, _ParameterKind
-from typing import Annotated, Any, ClassVar, Literal, Self, Union, get_args, get_origin
+from typing import Annotated, Any, ClassVar, Literal, Self, TypeAliasType, Union, get_args, get_origin
 
 from clio.agent import serialize_for_json
 
 
 def _parse_bool(value: str) -> bool:
-    r"""Parse string CLI argument into boolean value.
+    r"""Parse a CLI or environment string token into a boolean value.
 
     Args:
-        value (str): Raw string token from command line.
+        value (str): Raw string token from the command line or environment.
 
     Returns:
         bool: Parsed boolean value.
 
     Raises:
-        argparse.ArgumentTypeError: If string cannot be interpreted as a boolean.
+        ValueError: If `value` cannot be interpreted as a boolean.
     """
-    normalized = value.strip().lower()
-    if normalized in ("1", "true", "t", "yes", "y", "on"):
-        return True
-    if normalized in ("0", "false", "f", "no", "n", "off"):
-        return False
-    raise argparse.ArgumentTypeError(f"invalid boolean value: '{value}'")
+    match value.strip().lower():
+        case "1" | "true" | "t" | "yes" | "y" | "on":
+            return True
+        case "0" | "false" | "f" | "no" | "n" | "off":
+            return False
+        case _:
+            raise ValueError(f"invalid boolean value: {value!r}")
+
+
+def _substitute_type_params(tp_expr: Any, param_map: Mapping[Any, Any]) -> Any:
+    r"""Substitute PEP 695 generic type parameters inside an alias value expression."""
+    if not param_map:
+        return tp_expr
+    if tp_expr in param_map:
+        return param_map[tp_expr]
+
+    origin = get_origin(tp_expr)
+    if origin is None:
+        return tp_expr
+
+    args = get_args(tp_expr)
+    if not args:
+        return tp_expr
+
+    if origin is Annotated:
+        base_sub = _substitute_type_params(args[0], param_map)
+        return Annotated[(base_sub, *args[1:])]  # type: ignore[valid-type]
+
+    if origin in (types.UnionType, Union):
+        sub_args = [_substitute_type_params(a, param_map) for a in args]
+        acc = sub_args[0]
+        for nxt in sub_args[1:]:
+            acc = acc | nxt
+        return acc
+
+    sub_tuple = tuple(Ellipsis if a is Ellipsis else _substitute_type_params(a, param_map) for a in args)
+    try:
+        return origin[sub_tuple[0] if len(sub_tuple) == 1 else sub_tuple]
+    except TypeError:
+        return tp_expr
+
+
+def _eval_forward_ref(ref: ForwardRef, owner: Any = None) -> Any:
+    r"""Evaluate a Python 3.14 `ForwardRef` using `Format.FORWARDREF` without raising `NameError`."""
+    try:
+        return ref.evaluate(owner=owner, format=Format.FORWARDREF)
+    except NameError, AttributeError, TypeError, SyntaxError:
+        return ref
+
+
+def _coerce_scalar(raw: Any, target_ann: Any, param_name: str) -> Any:
+    r"""Coerce a single scalar value according to `target_ann`."""
+    if isinstance(target_ann, TypeAliasType):
+        target_ann, _, _ = DocstringParser._unwrap_annotation(target_ann)
+
+    origin = get_origin(target_ann)
+    if origin is Annotated:
+        target_ann = get_args(target_ann)[0]
+        origin = get_origin(target_ann)
+
+    if target_ann is bool:
+        return raw if isinstance(raw, bool) else _parse_bool(str(raw))
+
+    if origin is Literal:
+        choices = list(get_args(target_ann))
+        coerced = raw
+        if choices:
+            choice_types = {type(c) for c in choices}
+            if len(choice_types) == 1:
+                only_type = next(iter(choice_types))
+                if only_type is bool:
+                    coerced = raw if isinstance(raw, bool) else _parse_bool(str(raw))
+                elif not isinstance(raw, only_type):
+                    coerced = only_type(raw)
+            elif isinstance(raw, str):
+                for c in choices:
+                    if str(c) == raw:
+                        coerced = c
+                        break
+        if coerced not in choices:
+            raise ValueError(f"Invalid choice {raw!r} for '{param_name}' (choose from {choices})")
+        return coerced
+
+    if isinstance(target_ann, type) and issubclass(target_ann, enum.Enum):
+        if isinstance(raw, target_ann):
+            return raw
+        for member in target_ann:
+            if raw == member.value or str(raw) == str(member.value):
+                return member
+        if isinstance(raw, str):
+            for member in target_ann:
+                if member.name == raw or member.name.lower() == raw.lower():
+                    return member
+        valid = [m.value for m in target_ann]
+        raise ValueError(f"Invalid choice {raw!r} for '{param_name}' (choose from {valid})")
+
+    if (
+        target_ann not in (inspect.Parameter.empty, Any, object)
+        and origin is None
+        and not isinstance(target_ann, ForwardRef)
+        and callable(target_ann)
+    ):
+        if isinstance(target_ann, type) and isinstance(raw, target_ann):
+            return raw
+        return target_ann(raw)
+
+    return raw
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +194,7 @@ class ParameterSpec:
 
     Attributes:
         name (str): Parameter identifier name.
-        annotation (Any): Resolved type annotation (unwrapped from `Annotated` and optional union).
+        annotation (Any): Resolved type annotation (unwrapped from `Annotated`, `TypeAliasType`, and optional union).
         default (Any): Default parameter value, or `inspect.Parameter.empty`.
         docstring (str): Resolved help description from `Arg.help`, field metadata, or docstring.
         is_optional (bool): Whether parameter accepts `None` or has a default value.
@@ -135,7 +235,7 @@ class ParameterSpec:
 
     @property
     def option_flags(self) -> tuple[str, ...]:
-        r"""All CLI flag strings (including short flags from `Arg.short`) for `parser.add_argument`."""
+        r"""All CLI flag strings (including short flags from `Arg.short`)."""
         if self.is_positional:
             return (self.name,)
         primary = self.flag_name
@@ -147,6 +247,18 @@ class ParameterSpec:
         return tuple(flags)
 
     @property
+    def negated_flag(self) -> str | None:
+        r"""Negated `--no-<name>` option flag for non-positional boolean parameters, or `None`."""
+        if self.annotation is bool and not self.is_positional:
+            return f"--no-{self.name.replace('_', '-')}"
+        return None
+
+    @property
+    def show_negated_in_help(self) -> bool:
+        r"""Whether `--no-<name>` should be displayed alongside `--<name>` in help output."""
+        return self.negated_flag is not None and (not self.has_default or self.default is not False)
+
+    @property
     def type_label(self) -> str:
         r"""Human-readable representation of the parameter's annotation via `annotationlib.type_repr`."""
         if self.annotation is inspect.Parameter.empty:
@@ -155,128 +267,85 @@ class ParameterSpec:
             return self.annotation.__forward_arg__
         return type_repr(self.annotation)
 
-    def _coerce_env_value(self, raw_env: str) -> Any:
-        r"""Convert a raw environment variable string according to `self.annotation`."""
+    @property
+    def choices_tuple(self) -> tuple[Any, ...] | None:
+        r"""Tuple of allowed choice values if constrained by `Arg.choices`, `Literal`, or `Enum`."""
+        if self.arg_meta is not None and self.arg_meta.choices is not None:
+            return tuple(self.arg_meta.choices)
+
         ann = self.annotation
         origin = get_origin(ann)
-        if ann is bool:
-            return _parse_bool(raw_env)
-        if origin in (list, tuple, set, Sequence, Iterable, AbstractSet) or ann in (list, tuple, set):
-            parts = [part.strip() for part in raw_env.split(",") if part.strip()]
-            item_args = get_args(ann)
-            if item_args:
-                item_ann = item_args[0]
-                if item_ann not in (Any, object) and not isinstance(item_ann, ForwardRef) and callable(item_ann):
-                    return [item_ann(p) for p in parts]
-            return parts
-        if (
-            ann not in (inspect.Parameter.empty, Any, object)
-            and origin is None
-            and not isinstance(ann, ForwardRef)
-            and callable(ann)
+        if origin is Literal:
+            return tuple(get_args(ann))
+        if isinstance(ann, type) and issubclass(ann, enum.Enum):
+            return tuple(member.value for member in ann)
+
+        if origin in (list, set, Sequence, Iterable, AbstractSet) or (
+            origin is tuple and (not get_args(ann) or Ellipsis in get_args(ann))
         ):
-            return ann(raw_env)
-        return raw_env
-
-    def _build_argparse_kwargs(self) -> dict[str, Any]:
-        r"""Construct the keyword dictionary for `ArgumentParser.add_argument`."""
-        has_default = self.has_default
-        is_pos = self.is_positional
-        effective_default = self.default
-        meta = self.arg_meta
-
-        if meta is not None and meta.env:
-            env_val = os.environ.get(meta.env)
-            if env_val is not None:
-                effective_default = self._coerce_env_value(env_val)
-                has_default = True
-
-        kwargs: dict[str, Any] = {}
-
-        if is_pos:
-            if has_default:
-                kwargs["nargs"] = "?"
-                kwargs["default"] = effective_default
-        else:
-            if has_default:
-                kwargs["default"] = effective_default
-            else:
-                kwargs["required"] = True
-
-        help_str = self.docstring
-        if meta is not None and meta.env:
-            env_tag = f"[env: {meta.env}]"
-            if env_tag not in help_str:
-                help_str = f"{help_str} {env_tag}".strip()
-        if help_str:
-            kwargs["help"] = help_str
-
-        if meta is not None and meta.metavar is not None:
-            kwargs["metavar"] = meta.metavar
-
-        ann = self.annotation
-        origin = get_origin(ann)
-
-        if ann is bool:
-            if is_pos:
-                kwargs["type"] = _parse_bool
-            elif effective_default is False:
-                kwargs["action"] = "store_true"
-                kwargs.pop("metavar", None)
-            else:
-                kwargs["action"] = argparse.BooleanOptionalAction
-                kwargs.pop("metavar", None)
-        elif origin is Literal:
-            choices = list(get_args(ann))
-            kwargs["choices"] = choices
-            if choices:
-                choice_types = {type(c) for c in choices}
-                if len(choice_types) == 1:
-                    kwargs["type"] = next(iter(choice_types))
-        elif origin in (list, tuple, set, Sequence, Iterable, AbstractSet) or ann in (list, tuple, set):
-            kwargs["nargs"] = "+" if (is_pos or not has_default) else "*"
             item_args = get_args(ann)
             if item_args:
                 item_ann = item_args[0]
                 if get_origin(item_ann) is Literal:
-                    choices = list(get_args(item_ann))
-                    kwargs["choices"] = choices
-                    if choices and len({type(c) for c in choices}) == 1:
-                        kwargs["type"] = type(choices[0])
-                elif item_ann not in (Any, object) and not isinstance(item_ann, ForwardRef) and callable(item_ann):
-                    kwargs["type"] = item_ann
-        elif (
-            ann not in (inspect.Parameter.empty, Any, object)
-            and origin is None
-            and not isinstance(ann, ForwardRef)
-            and callable(ann)
-        ):
-            kwargs["type"] = ann
+                    return tuple(get_args(item_ann))
+                if isinstance(item_ann, type) and issubclass(item_ann, enum.Enum):
+                    return tuple(member.value for member in item_ann)
 
-        if meta is not None and meta.choices is not None:
-            kwargs["choices"] = list(meta.choices)
+        return None
 
-        return kwargs
+    @property
+    def is_variadic_collection(self) -> bool:
+        r"""Whether the parameter accepts a variable-length sequence of CLI tokens."""
+        ann = self.annotation
+        origin = get_origin(ann)
+        if origin in (list, set, Sequence, Iterable, AbstractSet) or ann in (list, set):
+            return True
+        if ann is tuple:
+            return True
+        if origin is tuple:
+            args = get_args(ann)
+            return not args or (len(args) == 2 and args[1] is Ellipsis)
+        return False
 
-    def to_argparse(self) -> tuple[str, dict[str, Any]]:
-        r"""Compile parameter specification into primary `ArgumentParser.add_argument` name and keyword arguments.
+    @property
+    def fixed_tuple_types(self) -> tuple[Any, ...] | None:
+        r"""Element types when `annotation` is a fixed-length `tuple[T1, T2, ...]`, else `None`."""
+        ann = self.annotation
+        if get_origin(ann) is tuple:
+            args = get_args(ann)
+            if args and not (len(args) == 2 and args[1] is Ellipsis):
+                if args == ((),):
+                    return ()
+                return tuple(args)
+        return None
 
-        Returns:
-            tuple[str, dict[str, Any]]: A `(arg_name, kwargs)` pair ready for `parser.add_argument`.
-        """
-        return self.flag_name, self._build_argparse_kwargs()
+    @property
+    def token_arity(self) -> tuple[int, int | None]:
+        r"""Return `(min_tokens, max_tokens)` consumed per occurrence (`None` max means unbounded)."""
+        if self.annotation is bool and not self.is_positional:
+            return (0, 0)
+        fixed = self.fixed_tuple_types
+        if fixed is not None:
+            n = len(fixed)
+            return (n, n)
+        if self.is_variadic_collection:
+            min_tok = 0 if (self.has_default or not self.is_required) else 1
+            return (min_tok, None)
+        return (1, 1)
 
-    def to_argparse_args(self) -> tuple[tuple[str, ...], dict[str, Any]]:
-        r"""Compile parameter specification into full option flag tuple and keyword arguments.
-
-        Returns:
-            tuple[tuple[str, ...], dict[str, Any]]: A `(option_flags, kwargs)` pair supporting short flags.
-        """
-        flags = self.option_flags
-        kwargs = self._build_argparse_kwargs()
-        if not self.is_positional and len(flags) > 1:
-            kwargs["dest"] = self.name
-        return flags, kwargs
+    @property
+    def metavar_label(self) -> str:
+        r"""Placeholder label rendered in usage and option help columns."""
+        if self.arg_meta is not None and self.arg_meta.metavar is not None:
+            return self.arg_meta.metavar
+        choices = self.choices_tuple
+        if choices is not None:
+            return "{" + ",".join(str(c) for c in choices) + "}"
+        fixed = self.fixed_tuple_types
+        if fixed is not None and fixed:
+            base = self.name.upper()
+            return " ".join(f"{base}{i + 1}" for i in range(len(fixed)))
+        return self.name.upper()
 
     @property
     def is_required(self) -> bool:
@@ -287,9 +356,16 @@ class ParameterSpec:
             return False
         return True
 
+    def _coerce_env_value(self, raw_env: str) -> Any:
+        r"""Convert a raw environment variable string according to `self.annotation`."""
+        return self.coerce_value(raw_env)
+
     @classmethod
     def _annotation_to_json_schema(cls, ann: Any) -> dict[str, Any]:
-        r"""Map a resolved Python type annotation to a JSON Schema property fragment."""
+        r"""Map a resolved Python type annotation to a JSON Schema Draft 2020-12 property fragment."""
+        if isinstance(ann, TypeAliasType) or isinstance(get_origin(ann), TypeAliasType):
+            ann, _, _ = DocstringParser._unwrap_annotation(ann)
+
         if ann is inspect.Parameter.empty or ann in (Any, object) or isinstance(ann, ForwardRef):
             return {"type": "string"}
 
@@ -314,7 +390,22 @@ class ParameterSpec:
                     schema["type"] = type_schema["type"]
             return schema
 
-        if origin in (list, tuple, set, Sequence, Iterable, AbstractSet) or ann in (list, tuple, set):
+        if origin is tuple:
+            args = get_args(ann)
+            if args and not (len(args) == 2 and args[1] is Ellipsis):
+                if args == ((),):
+                    return {"type": "array", "maxItems": 0}
+                prefix = [cls._annotation_to_json_schema(a) for a in args]
+                return {
+                    "type": "array",
+                    "prefixItems": prefix,
+                    "minItems": len(prefix),
+                    "maxItems": len(prefix),
+                }
+            items_schema = cls._annotation_to_json_schema(args[0]) if args else {"type": "string"}
+            return {"type": "array", "items": items_schema}
+
+        if origin in (list, set, Sequence, Iterable, AbstractSet) or ann in (list, tuple, set):
             item_args = get_args(ann)
             items_schema = cls._annotation_to_json_schema(item_args[0]) if item_args else {"type": "string"}
             return {"type": "array", "items": items_schema}
@@ -322,21 +413,21 @@ class ParameterSpec:
         if origin in (dict, Mapping) or ann in (dict, Mapping):
             return {"type": "object"}
 
-        if ann is bool:
-            return {"type": "boolean"}
-        if ann is int:
-            return {"type": "integer"}
-        if ann is float:
-            return {"type": "number"}
-        if ann is str:
-            return {"type": "string"}
-        if isinstance(ann, type):
-            if issubclass(ann, os.PathLike):
+        match ann:
+            case _ if ann is bool:
+                return {"type": "boolean"}
+            case _ if ann is int:
+                return {"type": "integer"}
+            case _ if ann is float:
+                return {"type": "number"}
+            case _ if ann is str:
+                return {"type": "string"}
+            case type() if issubclass(ann, os.PathLike):
                 return {"type": "string", "format": "path"}
-            if issubclass(ann, enum.Enum):
+            case type() if issubclass(ann, enum.Enum):
                 return {"type": "string", "enum": [serialize_for_json(e.value) for e in ann]}
-
-        return {"type": "string"}
+            case _:
+                return {"type": "string"}
 
     def to_json_schema(self) -> dict[str, Any]:
         r"""Compile parameter specification into a JSON Schema property definition.
@@ -369,16 +460,16 @@ class ParameterSpec:
         return schema
 
     def coerce_value(self, value: Any) -> Any:
-        r"""Validate and coerce a raw JSON or Python value into the parameter's annotated type.
+        r"""Validate and coerce a raw CLI token, env string, JSON, or Python value into `self.annotation`.
 
         Args:
-            value (Any): Raw input value (e.g. from MCP `tools/call` or programmatic invocation).
+            value (Any): Raw input value or sequence of tokens.
 
         Returns:
             Any: Coerced Python value matching `self.annotation`.
 
         Raises:
-            ValueError: If `value` violates allowed choices or cannot be converted.
+            ValueError: If `value` violates allowed choices, arity, or type conversion.
         """
         if value is None:
             return None
@@ -387,56 +478,49 @@ class ParameterSpec:
         origin = get_origin(ann)
         meta = self.arg_meta
 
-        allowed_choices: list[Any] | None = None
-        if meta is not None and meta.choices is not None:
-            allowed_choices = list(meta.choices)
-        elif origin is Literal:
-            allowed_choices = list(get_args(ann))
+        explicit_choices: list[Any] | None = (
+            list(meta.choices) if meta is not None and meta.choices is not None else None
+        )
 
-        if ann is bool:
-            coerced: Any = value if isinstance(value, bool) else _parse_bool(str(value))
-        elif origin in (list, tuple, set, Sequence, Iterable, AbstractSet) or ann in (list, tuple, set):
+        fixed = self.fixed_tuple_types
+        if fixed is not None:
+            raw_seq = [p.strip() for p in value.split(",") if p.strip()] if isinstance(value, str) else list(value)
+            if len(raw_seq) != len(fixed):
+                raise ValueError(f"Expected {len(fixed)} values for '{self.name}', got {len(raw_seq)}")
+            coerced_tuple = tuple(
+                _coerce_scalar(raw_item, elem_ann, self.name) for raw_item, elem_ann in zip(raw_seq, fixed, strict=True)
+            )
+            if explicit_choices is not None:
+                for item in coerced_tuple:
+                    if item not in explicit_choices:
+                        raise ValueError(f"Invalid choice {item!r} for '{self.name}' (choose from {explicit_choices})")
+            return coerced_tuple
+
+        if self.is_variadic_collection:
             raw_items = [p.strip() for p in value.split(",") if p.strip()] if isinstance(value, str) else list(value)
             item_args = get_args(ann)
-            item_choices: list[Any] | None = None
             if item_args:
                 item_ann = item_args[0]
-                if get_origin(item_ann) is Literal:
-                    item_choices = list(get_args(item_ann))
-                    if item_choices and len({type(c) for c in item_choices}) == 1:
-                        item_type = type(item_choices[0])
-                        raw_items = [item if isinstance(item, item_type) else item_type(item) for item in raw_items]
-                elif item_ann not in (Any, object) and not isinstance(item_ann, ForwardRef) and callable(item_ann):
-                    raw_items = [item if isinstance(item, item_ann) else item_ann(item) for item in raw_items]
-            if item_choices is not None:
-                for item in raw_items:
-                    if item not in item_choices:
-                        raise ValueError(f"Invalid choice {item!r} for '{self.name}' (choose from {item_choices})")
+                coerced_items = [_coerce_scalar(item, item_ann, self.name) for item in raw_items]
+            else:
+                coerced_items = raw_items
+
+            if explicit_choices is not None:
+                for item in coerced_items:
+                    if item not in explicit_choices:
+                        raise ValueError(f"Invalid choice {item!r} for '{self.name}' (choose from {explicit_choices})")
+
             if origin is tuple or ann is tuple:
-                coerced = tuple(raw_items)
-            elif origin in (set, AbstractSet) or ann is set:
-                coerced = set(raw_items)
-            else:
-                coerced = list(raw_items)
-        elif origin is Literal:
-            if allowed_choices and len({type(c) for c in allowed_choices}) == 1:
-                target_type = type(allowed_choices[0])
-                coerced = value if isinstance(value, target_type) else target_type(value)
-            else:
-                coerced = value
-        elif (
-            ann not in (inspect.Parameter.empty, Any, object)
-            and origin is None
-            and not isinstance(ann, ForwardRef)
-            and callable(ann)
-        ):
-            coerced = value if isinstance(value, ann) else ann(value)
-        else:
-            coerced = value
+                return tuple(coerced_items)
+            if origin in (set, AbstractSet) or ann is set:
+                return set(coerced_items)
+            return list(coerced_items)
 
-        if allowed_choices is not None and coerced not in allowed_choices:
-            raise ValueError(f"Invalid choice {coerced!r} for '{self.name}' (choose from {allowed_choices})")
-
+        coerced = _coerce_scalar(value, ann, self.name)
+        if explicit_choices is not None and coerced not in explicit_choices:
+            if isinstance(coerced, enum.Enum) and coerced.value in explicit_choices:
+                return coerced
+            raise ValueError(f"Invalid choice {coerced!r} for '{self.name}' (choose from {explicit_choices})")
         return coerced
 
 
@@ -491,8 +575,6 @@ class DocstringParser:
         re.MULTILINE,
     )
 
-    _parse_bool = staticmethod(_parse_bool)
-
     @classmethod
     def clear_cache(cls) -> None:
         r"""Clear all cached docstring and `annotationlib` parameter specifications."""
@@ -532,8 +614,8 @@ class DocstringParser:
         r"""Resolve annotations on `target` using Python 3.14 `annotationlib` with `Format.FORWARDREF`.
 
         Evaluates PEP 649 `__annotate__` functions directly (and stringified annotations via `eval_str=True`),
-        attempting `ForwardRef.evaluate(owner=...)` for any deferred symbols while preserving unresolved
-        `ForwardRef` proxies instead of failing the entire callable.
+        evaluating any `ForwardRef`s with `Format.FORWARDREF` so unresolvable names stay safe `ForwardRef` proxies
+        without raising `NameError`.
 
         Args:
             target (Any): Function, method, or class to inspect.
@@ -542,12 +624,16 @@ class DocstringParser:
         Returns:
             dict[str, Any]: Mapping of parameter/attribute names to resolved annotations or `ForwardRef`s.
         """
-        fn = target.__func__ if inspect.ismethod(target) else target
-        if owner is None:
+        raw_fn = target.__func__ if inspect.ismethod(target) else target
+        fn = raw_fn if isinstance(raw_fn, type) else inspect.unwrap(raw_fn)
+        eval_owner: Any = owner
+        if eval_owner is None:
             if isinstance(target, type):
-                owner = target
+                eval_owner = target
             elif inspect.ismethod(target):
-                owner = target.__self__ if isinstance(target.__self__, type) else type(target.__self__)
+                eval_owner = target.__self__ if isinstance(target.__self__, type) else type(target.__self__)
+            else:
+                eval_owner = fn
 
         try:
             raw_hints = annotationlib.get_annotations(fn, format=Format.FORWARDREF)
@@ -558,13 +644,7 @@ class DocstringParser:
 
         resolved: dict[str, Any] = {}
         for key, val in raw_hints.items():
-            if isinstance(val, ForwardRef):
-                try:
-                    resolved[key] = val.evaluate(owner=owner)
-                except Exception:
-                    resolved[key] = val
-            else:
-                resolved[key] = val
+            resolved[key] = _eval_forward_ref(val, owner=eval_owner) if isinstance(val, ForwardRef) else val
         return resolved
 
     @classmethod
@@ -572,15 +652,23 @@ class DocstringParser:
         cls,
         callable_obj: Callable[..., Any],
         *,
-        owner: type[Any] | None = None,
+        owner: Any = None,
     ) -> tuple[Signature, dict[str, Any]]:
         r"""Return and cache `(Signature, resolved_annotations)` for `callable_obj` in a single `annotationlib` pass."""
-        fn = callable_obj.__func__ if inspect.ismethod(callable_obj) else callable_obj
-        if owner is None and inspect.ismethod(callable_obj):
-            owner = callable_obj.__self__ if isinstance(callable_obj.__self__, type) else type(callable_obj.__self__)
-        cache_key = (owner, fn)
+        raw_fn = callable_obj.__func__ if inspect.ismethod(callable_obj) else callable_obj
+        fn = inspect.unwrap(raw_fn)
+        eval_owner: Any = owner
+        if eval_owner is None:
+            if inspect.ismethod(callable_obj):
+                eval_owner = (
+                    callable_obj.__self__ if isinstance(callable_obj.__self__, type) else type(callable_obj.__self__)
+                )
+            else:
+                eval_owner = fn
+        cache_key = (eval_owner, fn)
         if (cached := cls._SIG_CACHE.get(cache_key)) is not None:
             return cached
+
         sig = inspect.signature(fn, annotation_format=Format.FORWARDREF)
         if any(isinstance(p.annotation, str) for p in sig.parameters.values()):
             try:
@@ -593,38 +681,36 @@ class DocstringParser:
             ann = param.annotation
             if ann is Parameter.empty:
                 continue
-            if isinstance(ann, ForwardRef):
-                try:
-                    hints[name] = ann.evaluate(owner=owner)
-                except Exception:
-                    hints[name] = ann
-            else:
-                hints[name] = ann
+            hints[name] = _eval_forward_ref(ann, owner=eval_owner) if isinstance(ann, ForwardRef) else ann
 
         result = (sig, hints)
         cls._SIG_CACHE[cache_key] = result
         return result
 
     @classmethod
-    def _iter_docstrings(cls, target: type[Any] | Callable[..., Any]) -> list[str]:
-        r"""Collect cleaned docstrings in priority order from a class MRO or callable."""
+    def _iter_docstrings(cls, target: Any) -> list[str]:
+        r"""Collect cleaned docstrings in priority order from a class MRO, module, or callable."""
         docs: list[str] = []
 
         if isinstance(target, type):
             classes_to_search = [b for b in target.__mro__ if not cls._is_ignored_base(b)]
+        elif isinstance(target, types.ModuleType):
+            if mod_doc := inspect.getdoc(target):
+                docs.append(mod_doc)
+            classes_to_search = []
         elif inspect.ismethod(target):
             owner = target.__self__ if isinstance(target.__self__, type) else type(target.__self__)
-            if own_doc := inspect.getdoc(target):
+            if own_doc := inspect.getdoc(inspect.unwrap(target)):
                 if not cls._is_ignored_base(owner) or target.__name__ not in ("__init__", "__call__"):
                     docs.append(own_doc)
             classes_to_search = [b for b in owner.__mro__ if not cls._is_ignored_base(b)]
         elif inspect.isfunction(target):
-            if own_doc := inspect.getdoc(target):
+            if own_doc := inspect.getdoc(inspect.unwrap(target)):
                 docs.append(own_doc)
             classes_to_search = []
         else:
             if "__call__" in type(target).__dict__:
-                if call_doc := inspect.getdoc(type(target).__dict__["__call__"]):
+                if call_doc := inspect.getdoc(inspect.unwrap(type(target).__dict__["__call__"])):
                     docs.append(call_doc)
             classes_to_search = [b for b in type(target).__mro__ if not cls._is_ignored_base(b)]
 
@@ -634,17 +720,17 @@ class DocstringParser:
                 docs.append(inspect.cleandoc(raw_cls_doc))
             for method_name in ("__init__", "__call__"):
                 if method_name in base.__dict__:
-                    if method_doc := inspect.getdoc(base.__dict__[method_name]):
+                    if method_doc := inspect.getdoc(inspect.unwrap(base.__dict__[method_name])):
                         docs.append(method_doc)
 
         return docs
 
     @classmethod
-    def parse_description(cls, target: type[Any] | Callable[..., Any]) -> tuple[str, str]:
+    def parse_description(cls, target: Any) -> tuple[str, str]:
         r"""Extract and cache cleaned description and short summary help text from a class or callable.
 
         Strips parameter and metadata sections (such as `Args:` or `Parameters`) so only
-        the prose description remains.
+        the prose description remains, without evaluating PEP 649 `__annotate__` closures.
 
         Args:
             target (type[Any] | Callable[..., Any]): Class or callable to extract documentation from.
@@ -686,7 +772,6 @@ class DocstringParser:
         params: dict[str, str] = {}
 
         for doc in docs_to_search:
-            # 1. Try Google-style Args:/Parameters:/Attributes: sections
             for g_match in cls._GOOGLE_SECTION_RE.finditer(doc):
                 section = g_match.group("content")
                 for item in cls._GOOGLE_ITEM_RE.finditer(section):
@@ -697,7 +782,6 @@ class DocstringParser:
                     if desc and name not in params:
                         params[name] = desc
 
-            # 2. Try NumPy-style Parameters/Attributes sections
             for n_match in cls._NUMPY_SECTION_RE.finditer(doc):
                 section = n_match.group("content")
                 for item in cls._NUMPY_ITEM_RE.finditer(section):
@@ -711,42 +795,83 @@ class DocstringParser:
         return dict(params)
 
     @classmethod
-    def _unwrap_annotation(cls, raw_ann: Any) -> tuple[Any, bool, Arg | None]:
-        r"""Unwrap `Annotated[T, ...]` and `T | None` / `Optional[T]` into `(inner_type, has_none, arg_meta)`."""
+    def _unwrap_annotation(
+        cls,
+        raw_ann: Any,
+        *,
+        owner: Any = None,
+    ) -> tuple[Any, bool, Arg | None]:
+        r"""Unwrap `Annotated[T, ...]`, PEP 695 `TypeAliasType`, `ForwardRef`, and `T | None` into `(inner_type, has_none, arg_meta)`."""
         arg_meta: Arg | None = None
         has_none = False
         current = raw_ann
 
         while True:
+            if isinstance(current, ForwardRef):
+                evaluated = _eval_forward_ref(current, owner=owner)
+                if evaluated is not current and not isinstance(evaluated, ForwardRef):
+                    current = evaluated
+                    continue
+                break
+
+            if isinstance(current, TypeAliasType):
+                current = current.__value__
+                continue
+
             origin = get_origin(current)
+            if isinstance(origin, TypeAliasType):
+                type_params = origin.__type_params__
+                type_args = get_args(current)
+                param_map = dict(zip(type_params, type_args, strict=False))
+                current = _substitute_type_params(origin.__value__, param_map)
+                continue
+
             if origin is Annotated:
                 ann_args = get_args(current)
                 current = ann_args[0]
+                layer_meta: Arg | None = None
                 for meta_item in ann_args[1:]:
                     if isinstance(meta_item, Arg):
-                        arg_meta = meta_item if arg_meta is None else arg_meta.merge(meta_item)
+                        layer_meta = meta_item if layer_meta is None else layer_meta.merge(meta_item)
                     elif isinstance(meta_item, str) and meta_item.strip():
                         str_arg = Arg(help=meta_item.strip())
-                        arg_meta = str_arg if arg_meta is None else arg_meta.merge(str_arg)
+                        layer_meta = str_arg if layer_meta is None else layer_meta.merge(str_arg)
+                if layer_meta is not None:
+                    # Outer Annotated layers take precedence over inner TypeAliasType Annotated layers
+                    arg_meta = layer_meta if arg_meta is None else layer_meta.merge(arg_meta)
                 continue
 
             if origin in (types.UnionType, Union):
-                union_args = get_args(current)
+                union_args = [
+                    _eval_forward_ref(a, owner=owner) if isinstance(a, ForwardRef) else a for a in get_args(current)
+                ]
                 non_none = [a for a in union_args if a is not type(None)]
                 if len(non_none) < len(union_args):
                     has_none = True
                 if len(non_none) == 1:
                     current = non_none[0]
                     continue
+                if union_args:
+                    acc = non_none[0] if non_none else type(None)
+                    for nxt in non_none[1:]:
+                        acc = acc | nxt
+                    current = acc
+                break
+
             break
 
-        return current, has_none, arg_meta
+        # Evaluate ForwardRef element args inside generic containers when resolvable
+        container_origin = get_origin(current)
+        if container_origin in (list, tuple, set, Sequence, Iterable, AbstractSet):
+            c_args = get_args(current)
+            if c_args and any(isinstance(a, ForwardRef) for a in c_args):
+                eval_args = tuple(_eval_forward_ref(a, owner=owner) if isinstance(a, ForwardRef) else a for a in c_args)
+                try:
+                    current = container_origin[eval_args[0] if len(eval_args) == 1 else eval_args]
+                except TypeError:
+                    pass
 
-    @staticmethod
-    def _unwrap_optional(raw_ann: Any) -> tuple[Any, bool]:
-        r"""Unwrap `T | None` / `Optional[T]` (and `Annotated`) into `(inner_type, has_none)`."""
-        inner, has_none, _ = DocstringParser._unwrap_annotation(raw_ann)
-        return inner, has_none
+        return current, has_none, arg_meta
 
     @classmethod
     def _get_dataclass_specs(cls, dc_cls: type[Any]) -> list[ParameterSpec]:
@@ -766,7 +891,7 @@ class DocstringParser:
                 continue
 
             raw_ann = type_hints.get(f.name, f.type)
-            annotation, has_none, arg_meta = cls._unwrap_annotation(raw_ann)
+            annotation, has_none, arg_meta = cls._unwrap_annotation(raw_ann, owner=dc_cls)
 
             if f.default is not dataclasses.MISSING:
                 default: Any = f.default
@@ -818,7 +943,7 @@ class DocstringParser:
         r"""Introspect and cache signature, `annotationlib` annotations, defaults, and docstrings into `ParameterSpec` items.
 
         Supports classes, `@dataclass` types (including expanding nested dataclass parameters),
-        `Command` subclasses, `Annotated[T, Arg(...)]` metadata, and standalone callables.
+        `Command` subclasses, PEP 695 `type` aliases, `Annotated[T, Arg(...)]` metadata, and standalone callables.
 
         Args:
             target (type[Any] | Callable[..., Any]): Class or callable to introspect.
@@ -841,8 +966,16 @@ class DocstringParser:
                 return specs
 
         callable_obj = cls._resolve_callable(target)
-        owner = target if isinstance(target, type) else None
-        sig, type_hints = cls.inspect_callable(callable_obj, owner=owner)
+        eval_owner: Any = (
+            target
+            if isinstance(target, type)
+            else (
+                callable_obj.__self__
+                if inspect.ismethod(callable_obj) and isinstance(callable_obj.__self__, type)
+                else (type(callable_obj.__self__) if inspect.ismethod(callable_obj) else inspect.unwrap(callable_obj))
+            )
+        )
+        sig, type_hints = cls.inspect_callable(callable_obj, owner=eval_owner)
         param_docs = cls.parse_parameters(target)
         specs = []
 
@@ -853,14 +986,7 @@ class DocstringParser:
                 continue
 
             raw_ann = type_hints.get(param.name, param.annotation)
-            if (
-                raw_ann is argparse.Namespace
-                or raw_ann in ("argparse.Namespace", "Namespace")
-                or (isinstance(raw_ann, ForwardRef) and raw_ann.__forward_arg__ in ("argparse.Namespace", "Namespace"))
-            ):
-                continue
-
-            annotation, has_none, arg_meta = cls._unwrap_annotation(raw_ann)
+            annotation, has_none, arg_meta = cls._unwrap_annotation(raw_ann, owner=eval_owner)
 
             # Expand nested @dataclass parameters inline into their constituent CLI flags
             if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
@@ -930,59 +1056,3 @@ class DocstringParser:
         if key is not None:
             cls._DOC_SPEC_CACHE[key] = result
         return result
-
-    @classmethod
-    def backfill_help(
-        cls,
-        parser: argparse.ArgumentParser,
-        target: type[Any] | Callable[..., Any] | Mapping[str, str],
-    ) -> None:
-        r"""Back-fill missing `help` strings on existing parser actions from parsed docstrings.
-
-        Args:
-            parser (argparse.ArgumentParser): Target parser whose actions should be updated.
-            target (type[Any] | Callable[..., Any] | Mapping[str, str]): Class, callable, or parameter doc mapping.
-        """
-        param_docs = target if isinstance(target, Mapping) else cls.parse_parameters(target)
-        if not param_docs:
-            return
-        for action in parser._actions:
-            if action.help is None and action.dest in param_docs:
-                action.help = param_docs[action.dest]
-
-    @classmethod
-    def populate_parser(
-        cls,
-        parser: argparse.ArgumentParser,
-        target: type[Any] | Callable[..., Any] | DocstringSpec | Iterable[ParameterSpec],
-    ) -> None:
-        r"""Register CLI arguments on an `ArgumentParser` from a class, callable, `DocstringSpec`, or `ParameterSpec` iterable.
-
-        Skips any parameter whose `dest` is already registered on `parser`, and back-fills missing
-        `help` text on manually registered arguments from docstrings.
-
-        Args:
-            parser (argparse.ArgumentParser): Argument parser to populate.
-            target (type[Any] | Callable[..., Any] | DocstringSpec | Iterable[ParameterSpec]): Introspection source.
-        """
-        if isinstance(target, DocstringSpec):
-            specs: Sequence[ParameterSpec] = target.specs
-            param_docs: Mapping[str, str] = target.parameters
-        elif isinstance(target, type) or callable(target):
-            doc_spec = cls.inspect(target)
-            specs = doc_spec.specs
-            param_docs = doc_spec.parameters
-        else:
-            specs = tuple(target)
-            param_docs = {s.name: s.docstring for s in specs if s.docstring}
-
-        existing_dests = {action.dest for action in parser._actions}
-
-        for spec in specs:
-            if spec.name in existing_dests:
-                continue
-            flags, kwargs = spec.to_argparse_args()
-            parser.add_argument(*flags, **kwargs)
-            existing_dests.add(spec.name)
-
-        cls.backfill_help(parser, param_docs)

@@ -16,6 +16,12 @@ Complete API reference for `clio`, rendered via `mkdocstrings[python]`.
 
 ---
 
+## Native Token Scanner & Help Formatter (`clio.parser`)
+
+::: clio.parser
+
+---
+
 ## Commands & Dispatch (`clio.command`)
 
 ::: clio.command
@@ -28,7 +34,13 @@ Complete API reference for `clio`, rendered via `mkdocstrings[python]`.
 
 ---
 
-## ANSI Colors & Help Formatting (`clio.color`)
+## Terminal Spinners (`clio.spinner`)
+
+::: clio.spinner
+
+---
+
+## ANSI Colors & Styling (`clio.color`)
 
 ::: clio.color
 
@@ -37,3 +49,9 @@ Complete API reference for `clio`, rendered via `mkdocstrings[python]`.
 ## Agentic Coding & MCP (`clio.agent`)
 
 ::: clio.agent
+
+---
+
+## Zero-Edit Target Runner (`clio.runner`)
+
+::: clio.runner

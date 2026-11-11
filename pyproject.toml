@@ -1,12 +1,15 @@
 [project]
 name = "clio"
 dynamic = ["version"]
-description = "Lightweight, zero-dependency, object-oriented CLI framework built on argparse."
+description = "Lightweight, zero-dependency, agent-native CLI framework for Python 3.14+."
 readme = "README.md"
 authors = [
     { name = "Tom Stanton", email = "tomdstanton@gmail.com" }
 ]
 requires-python = ">=3.14"
+
+[project.scripts]
+clio = "clio.runner:main"
 
 [dependency-groups]
 docs = [
@@ -107,7 +110,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-omit = ["src/clio/_version.py"]
+omit = ["src/clio/_version.py", "*/_version.py"]
 
 [tool.zenzic]
 strict = false

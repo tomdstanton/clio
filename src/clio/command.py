@@ -1,27 +1,29 @@
-import argparse
 import dataclasses
+import enum
 import inspect
 import os
 import types
 from abc import ABC, abstractmethod
-from annotationlib import ForwardRef, type_repr
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Self, override
 
 from clio.agent import ToolSpec
-from clio.color import ColorHelpFormatter, Colors
-from clio.docstr import Arg, DocstringParser, DocstringSpec, ParameterSpec
+from clio.color import Colors
+from clio.docstr import DocstringParser, DocstringSpec, ParameterSpec
+from clio.parser import _DEFAULT_FORMATTER, HelpFormatter, ScanPlan, _clone_default
 
 if TYPE_CHECKING:
     from clio.cli import Cli
+
+type CommandTarget = BaseCommand | type[Any] | Callable[..., Any]
 
 
 def _get_cmd_meta(target_cls: type[Any], attr: str, default: Any = "") -> Any:
     r"""Extract class-level command metadata (`name`, `aliases`, `description`, `help_text`) safely.
 
     Handles `@dataclass(slots=True)` classes where slotted attributes become `member_descriptor`
-    objects and distinguishes `init=True` CLI fields from command metadata.
+    objects and distinguishes `init=True` CLI fields from command metadata without evaluating `__annotate__`.
     """
     if dataclasses.is_dataclass(target_cls):
         for f in dataclasses.fields(target_cls):
@@ -40,6 +42,138 @@ def _get_cmd_meta(target_cls: type[Any], attr: str, default: Any = "") -> Any:
     return val
 
 
+def _format_spec_type(spec: ParameterSpec) -> str:
+    r"""Format the type or allowed choices of a `ParameterSpec` for Markdown tables."""
+    choices = spec.choices_tuple
+    if choices is not None:
+        return ", ".join(f"`{c}`" for c in choices)
+    return f"`{spec.type_label}`"
+
+
+def _format_spec_default(spec: ParameterSpec) -> str:
+    r"""Format the default value or required status of a `ParameterSpec` for Markdown tables."""
+    if spec.is_required:
+        return "*required*"
+    if not spec.has_default or spec.default is None:
+        return "`None`"
+    if isinstance(spec.default, enum.Enum):
+        return f"`{spec.default.value!r}`"
+    return f"`{spec.default!r}`"
+
+
+def _escape_md_cell(text: str | None) -> str:
+    r"""Sanitize text for placement inside a Markdown table cell."""
+    if not text:
+        return ""
+    cleaned = Colors.strip_ansi(text).strip()
+    return " ".join(cleaned.splitlines()).replace("|", r"\|")
+
+
+def _format_spec_description(spec: ParameterSpec) -> str:
+    r"""Format a parameter's Markdown description including `[env: ...]` metadata."""
+    desc = spec.docstring
+    if spec.arg_meta is not None and spec.arg_meta.env:
+        env_tag = f"[env: {spec.arg_meta.env}]"
+        if env_tag not in desc:
+            desc = f"{desc} {env_tag}".strip()
+    return _escape_md_cell(desc)
+
+
+def _coerce_subcommand(cmd: CommandTarget) -> BaseCommand:
+    r"""Instantiate a `BaseCommand` class or wrap a `@dataclass` or function into a `BaseCommand` instance."""
+    if isinstance(cmd, BaseCommand):
+        return cmd
+    if isinstance(cmd, type):
+        if issubclass(cmd, BaseCommand):
+            base_cls: type[BaseCommand] = cmd
+            if dataclasses.is_dataclass(cmd):
+                inst: BaseCommand = object.__new__(base_cls)
+                for f in dataclasses.fields(cmd):
+                    if f.default is not dataclasses.MISSING:
+                        object.__setattr__(inst, f.name, f.default)
+                    elif f.default_factory is not dataclasses.MISSING:
+                        object.__setattr__(inst, f.name, f.default_factory())
+                BaseCommand.__init__(inst)
+                return inst
+            return cmd()
+        if dataclasses.is_dataclass(cmd):
+            return Command.from_dataclass(cmd)
+        raise TypeError(f"Expected a BaseCommand, CommandGroup, @dataclass, or function, got {cmd!r}")
+    if callable(cmd):
+        return Command.from_function(cmd)
+    raise TypeError(f"Expected a BaseCommand, CommandGroup, @dataclass, or function, got {cmd!r}")
+
+
+class _LazyCommandEntry:
+    r"""Internal lazy command descriptor that indexes `(name, aliases)` without triggering PEP 649 `__annotate__`."""
+
+    __slots__ = ("_instance", "_raw", "aliases", "name")
+
+    def __init__(self, target: CommandTarget) -> None:
+        if isinstance(target, BaseCommand):
+            self._raw: CommandTarget = target
+            self._instance: BaseCommand | None = target
+            self.name: str = target.name
+            self.aliases: tuple[str, ...] = tuple(target.aliases)
+            return
+
+        if isinstance(target, type):
+            if issubclass(target, BaseCommand):
+                if inspect.isabstract(target):
+                    raise TypeError(f"Can't instantiate abstract command class {target.__name__}")
+                self._raw = target
+                self._instance = None
+                self.name = str(_get_cmd_meta(target, "name", "") or target.__name__.lower())
+                self.aliases = tuple(_get_cmd_meta(target, "aliases", ()) or ())
+                return
+            if dataclasses.is_dataclass(target):
+                if "__call__" not in target.__dict__:
+                    raise TypeError(
+                        f"Dataclass {target.__name__!r} must either define '__call__' or be wrapped with Command.from_dataclass()."
+                    )
+                self._raw = target
+                self._instance = None
+                self.name = str(_get_cmd_meta(target, "name", "") or target.__name__.lower())
+                self.aliases = tuple(_get_cmd_meta(target, "aliases", ()) or ())
+                return
+            raise TypeError(f"Expected a BaseCommand, CommandGroup, @dataclass, or function, got {target!r}")
+
+        if callable(target):
+            unwrapped = inspect.unwrap(target)
+            raw_name = str(getattr(unwrapped, "__name__", "") or getattr(target, "__name__", "") or "command")
+            if raw_name == "<lambda>":
+                raw_name = "lambda"
+            self._raw = target
+            self._instance = None
+            self.name = raw_name
+            self.aliases = (raw_name.replace("_", "-"),) if "_" in raw_name else ()
+            return
+
+        raise TypeError(f"Expected a BaseCommand, CommandGroup, @dataclass, or function, got {target!r}")
+
+    def summary(self) -> str:
+        r"""Return single-line command summary text without evaluating parameter annotations."""
+        if self._instance is not None:
+            return self._instance.help_text or self._instance.description
+        if isinstance(self._raw, type):
+            explicit_help = str(_get_cmd_meta(self._raw, "help_text", ""))
+            if explicit_help:
+                return explicit_help
+            explicit_desc = str(_get_cmd_meta(self._raw, "description", ""))
+            if explicit_desc:
+                return explicit_desc.strip().split("\n", 1)[0]
+        _, doc_help = DocstringParser.parse_description(self._raw)
+        return doc_help
+
+    def resolve(self, cli: Cli | None = None) -> BaseCommand:
+        r"""Instantiate (if needed) and bind the underlying `BaseCommand`."""
+        if self._instance is None:
+            self._instance = _coerce_subcommand(self._raw)
+        if cli is not None:
+            self._instance.cli = cli
+        return self._instance
+
+
 @dataclass(frozen=True, slots=True)
 class DataclassBinding:
     r"""Immutable descriptor for constructing a `@dataclass` parameter from parsed CLI flags.
@@ -47,7 +181,7 @@ class DataclassBinding:
     Attributes:
         param_name (str): Parameter name on `Command.__call__`.
         dc_cls (type[Any]): Target `@dataclass` type to instantiate.
-        field_names (tuple[str, ...]): Dataclass `init=True` field names to extract from `Namespace`.
+        field_names (tuple[str, ...]): Dataclass `init=True` field names to extract from parsed values.
         is_positional_only (bool): Whether the parameter is positional-only in `__call__`.
     """
 
@@ -61,14 +195,14 @@ class DataclassBinding:
 class CallPlan:
     r"""Immutable, pre-compiled execution dispatch plan for `Command.__call__`.
 
-    Eliminates runtime `inspect.signature` and `inspect.get_annotations` overhead
-    when building parsers and invoking commands.
+    Eliminates runtime `inspect.signature`, `annotationlib`, and `Namespace` overhead
+    when invoking synchronous or asynchronous commands.
 
     Attributes:
         has_custom_call (bool): Whether `__call__` was overridden on the command class.
-        is_namespace_call (bool): Whether `__call__` expects a single `argparse.Namespace` argument.
-        pos_params (tuple[tuple[str, bool], ...]): Positional-only `(name, is_namespace)` descriptors.
-        kw_params (tuple[tuple[str, bool], ...]): Keyword-capable `(name, is_namespace)` descriptors.
+        is_async (bool): Whether `__call__` is an `async def` coroutine function.
+        pos_params (tuple[str, ...]): Positional-only parameter names in declaration order.
+        kw_params (tuple[str, ...]): Keyword-capable parameter names.
         dc_bindings (tuple[DataclassBinding, ...]): Nested `@dataclass` parameter bindings.
         self_dc_fields (tuple[str, ...]): Field names when the `Command` class itself is a `@dataclass`.
         has_var_kw (bool): Whether `__call__` accepts `**kwargs`.
@@ -77,14 +211,98 @@ class CallPlan:
     """
 
     has_custom_call: bool = False
-    is_namespace_call: bool = False
-    pos_params: tuple[tuple[str, bool], ...] = ()
-    kw_params: tuple[tuple[str, bool], ...] = ()
+    is_async: bool = False
+    pos_params: tuple[str, ...] = ()
+    kw_params: tuple[str, ...] = ()
     dc_bindings: tuple[DataclassBinding, ...] = ()
     self_dc_fields: tuple[str, ...] = ()
     has_var_kw: bool = False
     consumed_names: frozenset[str] = frozenset()
     simple_kw_names: tuple[str, ...] = ()
+
+    @classmethod
+    def compile_callable(
+        cls,
+        call_fn: Callable[..., Any],
+        *,
+        owner: Any = None,
+        allow_self_dc: bool = False,
+    ) -> Self:
+        r"""Compile a stateless `CallPlan` for an arbitrary sync or `async` callable using `annotationlib`."""
+        unwrapped = inspect.unwrap(call_fn)
+        is_async = inspect.iscoroutinefunction(call_fn) or inspect.iscoroutinefunction(unwrapped)
+        eval_owner: Any = owner if owner is not None else unwrapped
+        sig, hints = DocstringParser.inspect_callable(call_fn, owner=eval_owner)
+
+        params = [p for idx, p in enumerate(sig.parameters.values()) if not (idx == 0 and p.name in ("self", "cls"))]
+        non_var_params = [
+            p for p in params if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        ]
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+
+        pos_list: list[str] = []
+        kw_list: list[str] = []
+        dc_list: list[DataclassBinding] = []
+        consumed: set[str] = set()
+
+        for param in params:
+            if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                continue
+            raw_ann = hints.get(param.name, param.annotation)
+            ann, _, _ = DocstringParser._unwrap_annotation(raw_ann, owner=eval_owner)
+
+            if isinstance(ann, type) and dataclasses.is_dataclass(ann):
+                f_names = tuple(f.name for f in dataclasses.fields(ann) if f.init)
+                is_pos_only = param.kind == inspect.Parameter.POSITIONAL_ONLY
+                dc_list.append(
+                    DataclassBinding(
+                        param_name=param.name,
+                        dc_cls=ann,
+                        field_names=f_names,
+                        is_positional_only=is_pos_only,
+                    )
+                )
+                if is_pos_only:
+                    pos_list.append(param.name)
+                consumed.update(f_names)
+                continue
+
+            if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+                pos_list.append(param.name)
+                consumed.add(param.name)
+            elif param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+                kw_list.append(param.name)
+                consumed.add(param.name)
+
+        self_dc_fields: tuple[str, ...] = ()
+        if (
+            allow_self_dc
+            and not non_var_params
+            and not has_var_kw
+            and isinstance(owner, type)
+            and dataclasses.is_dataclass(owner)
+        ):
+            self_dc_fields = tuple(f.name for f in dataclasses.fields(owner) if f.init)
+            consumed.update(self_dc_fields)
+
+        pos_tuple = tuple(pos_list)
+        kw_tuple = tuple(kw_list)
+        dc_tuple = tuple(dc_list)
+        simple_kw: tuple[str, ...] = ()
+        if kw_tuple and not pos_tuple and not dc_tuple and not self_dc_fields and not has_var_kw:
+            simple_kw = kw_tuple
+
+        return cls(
+            has_custom_call=True,
+            is_async=is_async,
+            pos_params=pos_tuple,
+            kw_params=kw_tuple,
+            dc_bindings=dc_tuple,
+            self_dc_fields=self_dc_fields,
+            has_var_kw=has_var_kw,
+            consumed_names=frozenset(consumed),
+            simple_kw_names=simple_kw,
+        )
 
     @classmethod
     def compile(cls, cmd_cls: type[BaseCommand]) -> Self:
@@ -101,197 +319,102 @@ class CallPlan:
         call_fn = cmd_cls.__call__
         if getattr(call_fn, "__isabstractmethod__", False):
             return cls(has_custom_call=False)
+        return cls.compile_callable(call_fn, owner=cmd_cls, allow_self_dc=True)
 
-        sig, hints = DocstringParser.inspect_callable(call_fn, owner=cmd_cls)
+    def invoke_callable(self, fn: Callable[..., Any], values: Mapping[str, Any]) -> Any:
+        r"""Execute `fn` using the pre-compiled parameter binding plan.
 
-        params = [p for idx, p in enumerate(sig.parameters.values()) if not (idx == 0 and p.name in ("self", "cls"))]
-        non_var_params = [
-            p for p in params if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-        ]
-        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        Args:
+            fn (Callable[..., Any]): Target callable to invoke.
+            values (Mapping[str, Any]): Coerced CLI argument dictionary.
 
-        if len(non_var_params) == 1 and not has_var_kw:
-            p0 = non_var_params[0]
-            ann0 = hints.get(p0.name, p0.annotation)
-            if (
-                ann0 is argparse.Namespace
-                or ann0 in ("argparse.Namespace", "Namespace")
-                or (isinstance(ann0, ForwardRef) and ann0.__forward_arg__ in ("argparse.Namespace", "Namespace"))
-            ):
-                return cls(has_custom_call=True, is_namespace_call=True)
-            if p0.name == "args" and ann0 in (inspect.Parameter.empty, Any) and p0.default is inspect.Parameter.empty:
-                return cls(has_custom_call=True, is_namespace_call=True)
+        Returns:
+            Any: Return value (or coroutine when `is_async` is `True`) produced by `fn`.
+        """
+        if self.simple_kw_names:
+            return fn(**{name: values[name] for name in self.simple_kw_names if name in values})
 
-        pos_list: list[tuple[str, bool]] = []
-        kw_list: list[tuple[str, bool]] = []
-        dc_list: list[DataclassBinding] = []
-        consumed: set[str] = set()
+        pos_args: list[Any] = []
+        kw_args: dict[str, Any] = {}
+        pos_dc_map = {b.param_name: b for b in self.dc_bindings if b.is_positional_only} if self.dc_bindings else {}
 
-        for param in params:
-            raw_ann = hints.get(param.name, param.annotation)
-            ann, _, _ = DocstringParser._unwrap_annotation(raw_ann)
-            is_ns = (
-                ann is argparse.Namespace
-                or ann in ("argparse.Namespace", "Namespace")
-                or (isinstance(ann, ForwardRef) and ann.__forward_arg__ in ("argparse.Namespace", "Namespace"))
-            )
+        for name in self.pos_params:
+            if (dc_b := pos_dc_map.get(name)) is not None:
+                dc_kwargs = {fname: values[fname] for fname in dc_b.field_names if fname in values}
+                pos_args.append(dc_b.dc_cls(**dc_kwargs))
+            elif name in values:
+                pos_args.append(values[name])
 
-            if isinstance(ann, type) and dataclasses.is_dataclass(ann):
-                f_names = tuple(f.name for f in dataclasses.fields(ann) if f.init)
-                dc_list.append(
-                    DataclassBinding(
-                        param_name=param.name,
-                        dc_cls=ann,
-                        field_names=f_names,
-                        is_positional_only=param.kind == inspect.Parameter.POSITIONAL_ONLY,
-                    )
-                )
-                consumed.update(f_names)
-                continue
+        for name in self.kw_params:
+            if name in values:
+                kw_args[name] = values[name]
 
-            if param.kind == inspect.Parameter.POSITIONAL_ONLY:
-                pos_list.append((param.name, is_ns))
-                if not is_ns:
-                    consumed.add(param.name)
-            elif param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
-                kw_list.append((param.name, is_ns))
-                if not is_ns:
-                    consumed.add(param.name)
+        for binding in self.dc_bindings:
+            if not binding.is_positional_only:
+                dc_kwargs = {fname: values[fname] for fname in binding.field_names if fname in values}
+                kw_args[binding.param_name] = binding.dc_cls(**dc_kwargs)
 
-        self_dc_fields: tuple[str, ...] = ()
-        if not non_var_params and not has_var_kw and dataclasses.is_dataclass(cmd_cls):
-            self_dc_fields = tuple(f.name for f in dataclasses.fields(cmd_cls) if f.init)
-            consumed.update(self_dc_fields)
+        if self.has_var_kw:
+            consumed = self.consumed_names
+            for key, val in values.items():
+                if key not in consumed:
+                    kw_args[key] = val
 
-        pos_tuple = tuple(pos_list)
-        kw_tuple = tuple(kw_list)
-        dc_tuple = tuple(dc_list)
-        simple_kw: tuple[str, ...] = ()
-        if (
-            kw_tuple
-            and not pos_tuple
-            and not dc_tuple
-            and not self_dc_fields
-            and not has_var_kw
-            and all(not is_ns for _, is_ns in kw_tuple)
-        ):
-            simple_kw = tuple(name for name, _ in kw_tuple)
+        return fn(*pos_args, **kw_args)
 
-        return cls(
-            has_custom_call=True,
-            is_namespace_call=False,
-            pos_params=pos_tuple,
-            kw_params=kw_tuple,
-            dc_bindings=dc_tuple,
-            self_dc_fields=self_dc_fields,
-            has_var_kw=has_var_kw,
-            consumed_names=frozenset(consumed),
-            simple_kw_names=simple_kw,
-        )
-
-    def invoke(self, command: Command, parsed_args: argparse.Namespace) -> Any:
+    def invoke(self, command: Command, values: Mapping[str, Any]) -> Any:
         r"""Execute `command.__call__` using the pre-compiled parameter binding plan.
 
         Args:
             command (Command): Active command instance.
-            parsed_args (argparse.Namespace): Parsed CLI arguments namespace.
+            values (Mapping[str, Any]): Coerced CLI argument dictionary.
 
         Returns:
-            Any: Return value produced by `command.__call__`.
+            Any: Return value (or coroutine when `is_async` is `True`) produced by `command.__call__`.
         """
-        raw_values = vars(parsed_args)
-        if self.simple_kw_names:
-            return command.__call__(**{name: raw_values[name] for name in self.simple_kw_names if name in raw_values})
-
-        pos_args: list[Any] = []
-        kw_args: dict[str, Any] = {}
-
         if self.self_dc_fields:
             for field_name in self.self_dc_fields:
-                if field_name in raw_values:
-                    object.__setattr__(command, field_name, raw_values[field_name])
+                if field_name in values:
+                    object.__setattr__(command, field_name, values[field_name])
+        return self.invoke_callable(command.__call__, values)
 
-        for name, is_ns in self.pos_params:
-            if is_ns:
-                pos_args.append(parsed_args)
-            elif name in raw_values:
-                pos_args.append(raw_values[name])
-
-        for name, is_ns in self.kw_params:
-            if is_ns:
-                kw_args[name] = parsed_args
-            elif name in raw_values:
-                kw_args[name] = raw_values[name]
-
-        for binding in self.dc_bindings:
-            dc_kwargs = {fname: raw_values[fname] for fname in binding.field_names if fname in raw_values}
-            dc_instance = binding.dc_cls(**dc_kwargs)
-            if binding.is_positional_only:
-                pos_args.append(dc_instance)
-            else:
-                kw_args[binding.param_name] = dc_instance
-
-        if self.has_var_kw:
-            consumed = self.consumed_names
-            for key, val in raw_values.items():
-                if (
-                    key not in consumed
-                    and key not in ("func", "command")
-                    and not key.endswith("_subcommand")
-                    and not key.startswith("_clio_")
-                ):
-                    kw_args[key] = val
-
-        return command.__call__(*pos_args, **kw_args)
-
-    def resolve_arguments(self, parsed_args: argparse.Namespace) -> dict[str, Any]:
-        r"""Extract resolved command argument bindings from `parsed_args` without executing `__call__`.
+    def resolve_arguments(self, values: Mapping[str, Any]) -> dict[str, Any]:
+        r"""Extract resolved command argument bindings from `values` without executing `__call__`.
 
         Args:
-            parsed_args (argparse.Namespace): Parsed CLI arguments namespace.
+            values (Mapping[str, Any]): Coerced CLI parameter values.
 
         Returns:
             dict[str, Any]: Mapping of resolved parameter names to bound values.
         """
-        raw_values = vars(parsed_args)
         if self.simple_kw_names:
-            return {name: raw_values[name] for name in self.simple_kw_names if name in raw_values}
+            return {name: values[name] for name in self.simple_kw_names if name in values}
 
-        if self.is_namespace_call or not self.has_custom_call:
-            return {
-                key: val
-                for key, val in raw_values.items()
-                if key not in ("func", "command", "verbose")
-                and not key.endswith("_subcommand")
-                and not key.startswith("_clio_")
-            }
+        if not self.has_custom_call:
+            return dict(values)
 
         resolved: dict[str, Any] = {}
         for field_name in self.self_dc_fields:
-            if field_name in raw_values:
-                resolved[field_name] = raw_values[field_name]
+            if field_name in values:
+                resolved[field_name] = values[field_name]
 
-        for name, is_ns in self.pos_params:
-            if not is_ns and name in raw_values:
-                resolved[name] = raw_values[name]
+        pos_dc_names = {b.param_name for b in self.dc_bindings if b.is_positional_only}
+        for name in self.pos_params:
+            if name not in pos_dc_names and name in values:
+                resolved[name] = values[name]
 
-        for name, is_ns in self.kw_params:
-            if not is_ns and name in raw_values:
-                resolved[name] = raw_values[name]
+        for name in self.kw_params:
+            if name in values:
+                resolved[name] = values[name]
 
         for binding in self.dc_bindings:
-            dc_kwargs = {fname: raw_values[fname] for fname in binding.field_names if fname in raw_values}
+            dc_kwargs = {fname: values[fname] for fname in binding.field_names if fname in values}
             resolved[binding.param_name] = binding.dc_cls(**dc_kwargs)
 
         if self.has_var_kw:
             consumed = self.consumed_names
-            for key, val in raw_values.items():
-                if (
-                    key not in consumed
-                    and key not in ("func", "command", "verbose")
-                    and not key.endswith("_subcommand")
-                    and not key.startswith("_clio_")
-                ):
+            for key, val in values.items():
+                if key not in consumed:
                     resolved[key] = val
 
         return resolved
@@ -299,7 +422,7 @@ class CallPlan:
 
 @dataclass(frozen=True, slots=True)
 class CommandSpec:
-    r"""Immutable, pre-compiled class metadata and dispatch specification for a command.
+    r"""Immutable, pre-compiled class metadata, scanner, and dispatch specification for a command.
 
     Attributes:
         name (str): Default command trigger name.
@@ -308,6 +431,7 @@ class CommandSpec:
         help_text (str): Single-line command summary text.
         docstring_spec (DocstringSpec): Cached docstring and parameter introspection result.
         call_plan (CallPlan): Pre-compiled `__call__` dispatch plan.
+        scan_plan (ScanPlan): Pre-compiled $O(1)$ CLI token scanner.
     """
 
     name: str
@@ -316,6 +440,7 @@ class CommandSpec:
     help_text: str
     docstring_spec: DocstringSpec
     call_plan: CallPlan
+    scan_plan: ScanPlan
 
     @classmethod
     def compile(cls, cmd_cls: type[BaseCommand]) -> Self:
@@ -345,62 +470,12 @@ class CommandSpec:
             help_text=raw_help,
             docstring_spec=doc_spec,
             call_plan=CallPlan.compile(cmd_cls),
+            scan_plan=ScanPlan.compile(doc_spec.specs),
         )
 
 
-def _format_action_type(action: argparse.Action) -> str:
-    r"""Format the type or choices of an `argparse.Action` for Markdown tables using `annotationlib.type_repr`."""
-    if action.choices is not None:
-        return ", ".join(f"`{c}`" for c in action.choices)
-    if (
-        isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction, argparse.BooleanOptionalAction))
-        or action.nargs == 0
-    ):
-        return "`bool`"
-    if action.type is not None:
-        if isinstance(action.type, type):
-            return f"`{type_repr(action.type)}`"
-        type_name = getattr(action.type, "__name__", str(action.type)).lstrip("_")
-        if type_name == "parse_bool":
-            type_name = "bool"
-        return f"`{type_name}`"
-    return "`str`"
-
-
-def _format_action_default(action: argparse.Action) -> str:
-    r"""Format the default value or required status of an `argparse.Action` for Markdown tables."""
-    is_positional = not action.option_strings
-    if getattr(action, "required", False) or (is_positional and action.nargs not in ("?", "*")):
-        return "*required*"
-    if isinstance(action, argparse._StoreTrueAction) and action.default is argparse.SUPPRESS:
-        return "`False`"
-    if action.default is argparse.SUPPRESS or action.default is None:
-        return "`None`"
-    return f"`{action.default!r}`"
-
-
-def _escape_md_cell(text: str | None) -> str:
-    r"""Sanitize text for placement inside a Markdown table cell."""
-    if not text:
-        return ""
-    cleaned = Colors.strip_ansi(text).strip()
-    return " ".join(cleaned.splitlines()).replace("|", r"\|")
-
-
-def _coerce_subcommand(cmd: BaseCommand | type[Any]) -> BaseCommand:
-    r"""Instantiate a `BaseCommand` class or wrap a `@dataclass` type into a `BaseCommand` instance."""
-    if isinstance(cmd, BaseCommand):
-        return cmd
-    if isinstance(cmd, type):
-        if issubclass(cmd, BaseCommand):
-            return cmd()
-        if dataclasses.is_dataclass(cmd):
-            return Command.from_dataclass(cmd)
-    raise TypeError(f"Expected a BaseCommand, CommandGroup, or @dataclass, got {cmd!r}")
-
-
 class BaseCommand(ABC):
-    r"""Abstract base class providing shared metadata, parser building, and subcommand routing.
+    r"""Abstract base class providing shared metadata, lazy subcommand routing, and introspection.
 
     Subclasses should inherit from [`Command`][clio.command.Command] for executable leaf/hybrid
     commands or [`CommandGroup`][clio.command.CommandGroup] for pure subcommand namespaces.
@@ -409,9 +484,8 @@ class BaseCommand(ABC):
         name (str): Identifier name used to trigger command on CLI.
         aliases (Sequence[str]): Alternative trigger names or abbreviations for command.
         description (str): Detailed text explanation shown in command help.
-        help_text (str): Brief single-line summary shown in parent subparser tables.
-        parser (argparse.ArgumentParser | None): Bound argument parser instance.
-        subcommands (list[BaseCommand | type[Any]]): Child subcommands (classes, dataclasses, or instances).
+        help_text (str): Brief single-line summary shown in parent subcommand tables.
+        subcommands (Sequence[CommandTarget]): Declarative child subcommands (classes, dataclasses, or instances).
         cli (Cli | None): Parent root CLI host application reference.
     """
 
@@ -421,7 +495,7 @@ class BaseCommand(ABC):
     aliases: Sequence[str] = ()
     description: str = ""
     help_text: str = ""
-    subcommands: list[BaseCommand | type[Any]] = []
+    subcommands: Sequence[CommandTarget] = ()
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         r"""Reset `_spec` slot on subclass definition for lazy compilation via `get_spec()`."""
@@ -442,9 +516,8 @@ class BaseCommand(ABC):
         r"""Return whether this command class defines an executable action handler."""
 
     def __init__(self) -> None:
-        r"""Initialize command instance from pre-compiled `CommandSpec` and register subcommands."""
+        r"""Initialize command instance from pre-compiled `CommandSpec` and index subcommands lazily."""
         spec = type(self).get_spec()
-        self.parser: argparse.ArgumentParser | None = None
         self.cli: Cli | None = None
 
         self.name = self.name or spec.name
@@ -456,124 +529,114 @@ class BaseCommand(ABC):
             elif self.description:
                 self.help_text = self.description.strip().split("\n", 1)[0]
 
-        cls_subcommands = type(self).__dict__.get("subcommands", ())
-        self.subcommands = [_coerce_subcommand(sub) for sub in (cls_subcommands or ())]
+        self._sub_entries: list[_LazyCommandEntry] = []
+        self._sub_route_map: dict[str, _LazyCommandEntry] = {}
+
+        cls_subcommands: Sequence[CommandTarget] = ()
+        for base in type(self).__mro__:
+            if base is BaseCommand:
+                break
+            if "subcommands" in base.__dict__:
+                cls_subcommands = base.__dict__["subcommands"] or ()
+                break
+
+        if cls_subcommands:
+            self.add_subcommand(*cls_subcommands)
 
         self.register_subcommands()
 
     def register_subcommands(self) -> None:  # noqa: B027
-        r"""Register child subcommand instances into `subcommands` list."""
+        r"""Hook for subclasses to register child subcommands via [`add_subcommand`][clio.command.BaseCommand.add_subcommand]."""
 
-    def add_subcommand(self, *commands: BaseCommand | type[Any]) -> Self:
-        r"""Append one or more child subcommands (classes, dataclasses, or instances) to `self.subcommands`.
+    def add_subcommand(self, *commands: CommandTarget) -> Self:
+        r"""Lazily index one or more child subcommands (classes, dataclasses, or instances) without compiling specs.
 
         Args:
-            *commands (BaseCommand | type[Any]): Subcommands to register.
+            *commands (CommandTarget): Subcommands to register.
 
         Returns:
             Self: The command instance for method chaining.
         """
         for cmd in commands:
-            self.subcommands.append(_coerce_subcommand(cmd))
+            entry = _LazyCommandEntry(cmd)
+            self._sub_entries.append(entry)
+            self._sub_route_map[entry.name] = entry
+            for alias in entry.aliases:
+                self._sub_route_map[alias] = entry
         return self
 
-    def setup_arguments(self) -> None:  # noqa: B027
-        r"""Configure argument flags and positional parameters on `self.parser`."""
+    def has_subcommands(self) -> bool:
+        r"""Return `True` if one or more child subcommands are registered on this command."""
+        return bool(self._sub_entries)
 
-    def add_arguments_from(
-        self,
-        target: type[Any] | Callable[..., Any] | Iterable[ParameterSpec],
-    ) -> None:
-        r"""Populate `self.parser` arguments by introspecting a class, dataclass, callable, or `ParameterSpec` iterable.
+    def get_subcommands(self) -> tuple[BaseCommand, ...]:
+        r"""Materialize and return all registered child subcommand instances."""
+        return tuple(entry.resolve(self.cli) for entry in self._sub_entries)
 
-        Args:
-            target (type[Any] | Callable[..., Any] | Iterable[ParameterSpec]): Target class, callable,
-                or parameter specifications to register on `self.parser`.
-        """
-        if self.parser is not None:
-            DocstringParser.populate_parser(self.parser, target)
+    def _match_subcommand(self, token: str) -> BaseCommand | None:
+        r"""Resolve and return the matching child subcommand for `token` in $O(1)$, or `None`."""
+        entry = self._sub_route_map.get(token)
+        if entry is None:
+            return None
+        return entry.resolve(self.cli)
 
-    def get_shared_parser(self) -> argparse.ArgumentParser | None:
-        r"""Return shared parent parser containing options passed to subcommands.
+    def _subcommand_names(self) -> tuple[str, ...]:
+        r"""Return canonical child subcommand names without instantiating them."""
+        return tuple(entry.name for entry in self._sub_entries)
+
+    def _subcommand_help_rows(self) -> tuple[tuple[str, Sequence[str], str], ...]:
+        r"""Return `(name, aliases, summary)` rows for `--help` without evaluating child `__annotate__`."""
+        return tuple((entry.name, entry.aliases, entry.summary()) for entry in self._sub_entries)
+
+    def get_scan_plan(self) -> ScanPlan:
+        r"""Return the compiled `ScanPlan` for this command."""
+        return type(self).get_spec().scan_plan
+
+    def get_parameter_specs(self) -> tuple[ParameterSpec, ...]:
+        r"""Return all `ParameterSpec` items for this command.
 
         Returns:
-            argparse.ArgumentParser | None: Shared non-help argument parser or `None`.
+            tuple[ParameterSpec, ...]: Ordered tuple of parameter specifications.
         """
-        return None
+        return type(self).get_spec().docstring_spec.specs
 
-    def _bind_execution(self, spec: CommandSpec) -> None:
-        r"""Bind command execution defaults and auto-populated parameters onto `self.parser`."""
-        assert self.parser is not None
-        DocstringParser.backfill_help(self.parser, spec.docstring_spec.parameters)
-
-    def build(
+    def format_usage(
         self,
-        subparsers: argparse._SubParsersAction[Any],
-        parent_parsers: list[argparse.ArgumentParser] | None = None,
-        formatter_class: type[argparse.HelpFormatter] = ColorHelpFormatter,
-    ) -> None:
-        r"""Wire command parser and subcommands into parent argparse hierarchy.
-
-        Args:
-            subparsers (argparse._SubParsersAction): Target subparser action registry.
-            parent_parsers (list[argparse.ArgumentParser] | None): Parent shared parsers to inherit.
-            formatter_class (type[argparse.HelpFormatter]): Help formatter class for the subparser.
-        """
-        spec = type(self).get_spec()
-        parents = parent_parsers or []
-
-        self.parser = subparsers.add_parser(
-            name=self.name,
-            aliases=self.aliases,
-            description=Colors.bold(self.description),
-            help=self.help_text or self.description,
-            parents=parents,
-            formatter_class=formatter_class,
+        *,
+        prog_prefix: str = "",
+        formatter: HelpFormatter | None = None,
+    ) -> str:
+        r"""Format the single-line CLI usage synopsis for this command."""
+        fmt = formatter or (self.cli.config.formatter if self.cli is not None else _DEFAULT_FORMATTER)
+        full_prog = f"{prog_prefix} {self.name}".strip() if self.name else prog_prefix.strip()
+        scan_plan = self.get_scan_plan()
+        return fmt.format_usage(
+            full_prog,
+            positionals=scan_plan.positionals,
+            has_options=True,
+            has_subcommands=self.has_subcommands(),
         )
 
-        # 1. Add specific arguments for this command
-        self.setup_arguments()
-
-        # 2. Auto-populate arguments and bind execution handler
-        self._bind_execution(spec)
-        self.parser.set_defaults(_clio_command=self)
-
-        # Attach opt-in agent flags onto subparser if enabled on parent Cli
-        if self.cli is not None and self.cli.config.enable_agent_flags:
-            self.cli._attach_agent_options(self.parser, command=self)
-
-        # Rename the default options group and move it to the bottom of the help menu
-        if hasattr(self.parser, "_optionals"):
-            self.parser._optionals.title = Colors.bold("🌎 Global options")
-            groups = self.parser._action_groups
-            if self.parser._optionals in groups:
-                groups.append(groups.pop(groups.index(self.parser._optionals)))
-
-        # 3. Process subcommands (if any)
-        if self.subcommands:
-            is_required = not self._is_executable()
-            sub_action = self.parser.add_subparsers(
-                title=Colors.bold(f"'{self.name}' subcommands"),
-                dest=f"{self.name}_subcommand",
-                required=is_required,
-            )
-
-            child_parents = parents.copy()
-            if shared := self.get_shared_parser():
-                DocstringParser.backfill_help(shared, spec.docstring_spec.parameters)
-                child_parents.append(shared)
-
-            built_subs: list[BaseCommand | type[Any]] = []
-            for raw_cmd in self.subcommands:
-                cmd = _coerce_subcommand(raw_cmd)
-                cmd.cli = self.cli
-                cmd.build(
-                    sub_action,
-                    parent_parsers=child_parents,
-                    formatter_class=formatter_class,
-                )
-                built_subs.append(cmd)
-            self.subcommands = built_subs
+    def format_help(
+        self,
+        *,
+        prog_prefix: str = "",
+        formatter: HelpFormatter | None = None,
+    ) -> str:
+        r"""Format complete ANSI help output for this command."""
+        fmt = formatter or (self.cli.config.formatter if self.cli is not None else _DEFAULT_FORMATTER)
+        enable_agent = self.cli.config.enable_agent_flags if self.cli is not None else False
+        full_prog = f"{prog_prefix} {self.name}".strip() if self.name else prog_prefix.strip()
+        return fmt.format_help(
+            full_prog,
+            description=self.description,
+            scan_plan=self.get_scan_plan(),
+            subcommands=self._subcommand_help_rows(),
+            subcommands_title=f"'{self.name}' subcommands",
+            has_version=False,
+            enable_agent_flags=enable_agent,
+            allow_mcp=False,
+        )
 
     def to_markdown(
         self,
@@ -593,15 +656,7 @@ class BaseCommand(ABC):
             str: Formatted Markdown reference documentation.
         """
         full_prog = f"{prog_prefix} {self.name}".strip()
-        parser = self.parser
-        if parser is None:
-            root = argparse.ArgumentParser(prog=prog_prefix, formatter_class=ColorHelpFormatter)
-            sub = root.add_subparsers(dest="command")
-            self.build(sub, formatter_class=ColorHelpFormatter)
-            parser = self.parser
-            if parser is not None:
-                parser.prog = full_prog
-        assert parser is not None
+        scan_plan = self.get_scan_plan()
 
         hashes = "#" * max(1, heading_level)
         lines: list[str] = [f"{hashes} `{full_prog}`"]
@@ -613,43 +668,40 @@ class BaseCommand(ABC):
         if self.description:
             lines.append(f"\n{Colors.strip_ansi(self.description).strip()}")
 
-        usage = Colors.strip_ansi(parser.format_usage()).strip()
+        usage = Colors.strip_ansi(self.format_usage(prog_prefix=prog_prefix)).strip()
         lines.append(f"\n```text\n{usage}\n```")
 
-        positionals: list[argparse.Action] = []
-        optionals: list[argparse.Action] = []
-        for action in parser._actions:
-            if isinstance(action, argparse._SubParsersAction):
-                continue
-            if not action.option_strings:
-                positionals.append(action)
-            else:
-                if not include_global_options and (
-                    action.dest.startswith("_clio_")
-                    or any(opt in ("-h", "--help", "-V", "--verbose") for opt in action.option_strings)
-                ):
-                    continue
-                optionals.append(action)
-
-        if positionals:
+        if scan_plan.positionals:
             lines.append("\n**Positional Arguments**\n")
             lines.append("| Argument | Type / Choices | Description |")
             lines.append("| :--- | :--- | :--- |")
-            for action in positionals:
-                lines.append(f"| `{action.dest}` | {_format_action_type(action)} | {_escape_md_cell(action.help)} |")
+            for pos in scan_plan.positionals:
+                lines.append(f"| `{pos.name}` | {_format_spec_type(pos)} | {_format_spec_description(pos)} |")
 
-        if optionals:
+        option_rows: list[str] = []
+        for opt in scan_plan.options:
+            flag_list = list(opt.option_flags)
+            if opt.show_negated_in_help and opt.negated_flag is not None and opt.negated_flag not in flag_list:
+                flag_list.append(opt.negated_flag)
+            flags = ", ".join(f"`{f}`" for f in flag_list)
+            option_rows.append(
+                f"| {flags} | {_format_spec_type(opt)} | {_format_spec_default(opt)} | {_format_spec_description(opt)} |"
+            )
+
+        if include_global_options:
+            if "-h" not in scan_plan.flag_map and "--help" not in scan_plan.flag_map:
+                option_rows.append("| `-h`, `--help` | `bool` | `False` | Show this help message and exit |")
+            if "-V" not in scan_plan.flag_map and "--verbose" not in scan_plan.flag_map:
+                option_rows.append("| `-V`, `--verbose` | `bool` | `False` | Enable verbose output/progress |")
+
+        if option_rows:
             lines.append("\n**Options**\n")
             lines.append("| Flag | Type / Choices | Default | Description |")
             lines.append("| :--- | :--- | :--- | :--- |")
-            for action in optionals:
-                flags = ", ".join(f"`{opt}`" for opt in action.option_strings)
-                lines.append(
-                    f"| {flags} | {_format_action_type(action)} | {_format_action_default(action)} | {_escape_md_cell(action.help)} |"
-                )
+            lines.extend(option_rows)
 
-        if self.subcommands:
-            resolved_subs = [_coerce_subcommand(c) for c in self.subcommands]
+        if self.has_subcommands():
+            resolved_subs = self.get_subcommands()
             lines.append("\n**Subcommands**\n")
             lines.append("| Subcommand | Aliases | Summary |")
             lines.append("| :--- | :--- | :--- |")
@@ -670,162 +722,81 @@ class BaseCommand(ABC):
 
         return "\n".join(lines)
 
-    def _ensure_parser(self, prog_prefix: str = "") -> argparse.ArgumentParser:
-        r"""Ensure `self.parser` is built (creating a temporary parser if needed) and return it."""
-        if self.parser is None:
-            full_prog = f"{prog_prefix} {self.name}".strip()
-            root = argparse.ArgumentParser(prog=prog_prefix, formatter_class=ColorHelpFormatter)
-            sub = root.add_subparsers(dest="command")
-            self.build(sub, formatter_class=ColorHelpFormatter)
-            if self.parser is not None and full_prog:
-                self.parser.prog = full_prog
-        assert self.parser is not None
-        return self.parser
-
-    def get_parameter_specs(self) -> tuple[ParameterSpec, ...]:
-        r"""Return all `ParameterSpec` items for this command, including imperative `setup_arguments` actions.
-
-        Returns:
-            tuple[ParameterSpec, ...]: Ordered tuple of parameter specifications.
-        """
-        base_specs = list(type(self).get_spec().docstring_spec.specs)
-        seen_names = {s.name: idx for idx, s in enumerate(base_specs)}
-
-        parser = self.parser
-        if parser is None and type(self).setup_arguments is not BaseCommand.setup_arguments:
-            parser = self._ensure_parser()
-
-        if parser is not None:
-            for action in parser._actions:
-                if isinstance(action, argparse._SubParsersAction):
-                    continue
-                dest = action.dest
-                if (
-                    dest in ("help", "version", "verbose", "command")
-                    or dest.startswith("_clio_")
-                    or dest.endswith("_subcommand")
-                ):
-                    continue
-                if dest in seen_names:
-                    idx = seen_names[dest]
-                    existing = base_specs[idx]
-                    if action.option_strings:
-                        merged_meta = Arg(
-                            short=tuple(action.option_strings),
-                            choices=tuple(action.choices) if action.choices is not None else None,
-                        )
-                        new_meta = merged_meta if existing.arg_meta is None else existing.arg_meta.merge(merged_meta)
-                        base_specs[idx] = dataclasses.replace(existing, arg_meta=new_meta)
-                    continue
-
-                is_pos = not action.option_strings
-                if isinstance(
-                    action,
-                    (argparse._StoreTrueAction, argparse._StoreFalseAction, argparse.BooleanOptionalAction),
-                ):
-                    ann: Any = bool
-                elif action.nargs in ("+", "*"):
-                    ann = list[action.type] if isinstance(action.type, type) else list[str]  # type: ignore[valid-type]
-                elif isinstance(action.type, type):
-                    ann = action.type
-                else:
-                    ann = str
-
-                has_req = getattr(action, "required", False) or (is_pos and action.nargs not in ("?", "*"))
-                default = inspect.Parameter.empty if has_req else action.default
-                choices = tuple(action.choices) if action.choices is not None else None
-                arg_meta = Arg(
-                    short=tuple(action.option_strings),
-                    choices=choices,
-                    positional=is_pos,
-                )
-                doc = (
-                    Colors.strip_ansi(action.help).strip()
-                    if action.help and action.help is not argparse.SUPPRESS
-                    else ""
-                )
-                base_specs.append(
-                    ParameterSpec(
-                        name=dest,
-                        annotation=ann,
-                        default=default,
-                        docstring=doc,
-                        is_optional=not has_req,
-                        arg_meta=arg_meta,
-                    )
-                )
-                seen_names[dest] = len(base_specs) - 1
-
-        return tuple(base_specs)
-
-    def resolve_arguments(self, parsed_args: argparse.Namespace) -> dict[str, Any]:
-        r"""Resolve a parsed `argparse.Namespace` into a dictionary of bound arguments without executing.
+    def resolve_arguments(self, values: Mapping[str, Any]) -> dict[str, Any]:
+        r"""Resolve parsed parameter values into bound command arguments without executing `__call__`.
 
         Args:
-            parsed_args (argparse.Namespace): Parsed CLI namespace.
+            values (Mapping[str, Any]): Coerced CLI parameter dictionary.
 
         Returns:
             dict[str, Any]: Dictionary of resolved parameter names and values.
         """
-        return type(self).get_spec().call_plan.resolve_arguments(parsed_args)
+        return type(self).get_spec().call_plan.resolve_arguments(values)
 
-    def invoke_with_arguments(self, arguments: Mapping[str, Any]) -> Any:
-        r"""Validate and coerce a dictionary of arguments and execute this command.
-
-        Args:
-            arguments (Mapping[str, Any]): Input arguments keyed by parameter name.
-
-        Returns:
-            Any: Return value produced by the command callable.
-
-        Raises:
-            ValueError: If required arguments are missing or invalid values are supplied.
-        """
+    def _prepare_argument_dict(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         specs = self.get_parameter_specs()
-        ns_values: dict[str, Any] = {"verbose": getattr(self.cli, "verbose", False)}
-
-        if self.parser is not None:
-            for action in self.parser._actions:
-                if (
-                    not isinstance(action, argparse._SubParsersAction)
-                    and action.dest not in ("help", "version", "command")
-                    and not action.dest.startswith("_clio_")
-                    and action.default is not argparse.SUPPRESS
-                ):
-                    ns_values.setdefault(action.dest, action.default)
+        values: dict[str, Any] = {}
 
         for spec in specs:
             if spec.name in arguments and arguments[spec.name] is not None:
-                ns_values[spec.name] = spec.coerce_value(arguments[spec.name])
+                values[spec.name] = spec.coerce_value(arguments[spec.name])
             elif spec.name in arguments and arguments[spec.name] is None:
                 if spec.is_optional:
-                    ns_values[spec.name] = None
+                    values[spec.name] = None
                 else:
                     raise ValueError(f"Argument '{spec.name}' cannot be null.")
             else:
                 meta = spec.arg_meta
                 if meta is not None and meta.env and meta.env in os.environ:
-                    ns_values[spec.name] = spec._coerce_env_value(os.environ[meta.env])
+                    values[spec.name] = spec._coerce_env_value(os.environ[meta.env])
                 elif spec.has_default:
-                    ns_values[spec.name] = spec.default
-                elif spec.annotation is bool and not spec.is_positional:
-                    ns_values[spec.name] = False
+                    values[spec.name] = _clone_default(spec.default)
                 elif spec.is_optional:
-                    ns_values[spec.name] = None
+                    values[spec.name] = None
                 else:
                     raise ValueError(f"Missing required argument: '{spec.name}'")
 
         for extra_key, extra_val in arguments.items():
-            if extra_key not in ns_values:
-                ns_values[extra_key] = extra_val
+            if extra_key not in values:
+                values[extra_key] = extra_val
 
-        ns = argparse.Namespace(**ns_values)
-        if isinstance(self, Command):
-            plan = type(self).get_spec().call_plan
-            if isinstance(self, DataclassCommand) or plan.is_namespace_call:
-                return self(ns)
-            return plan.invoke(self, ns)
-        raise TypeError(f"Command {self.name!r} is not executable.")
+        return values
+
+    def invoke_with_arguments(self, arguments: Mapping[str, Any]) -> Any:
+        r"""Validate and coerce a dictionary of arguments and execute this command.
+
+        For `async` commands, returns the unawaited coroutine object (use
+        [`invoke_with_arguments_async`][clio.command.BaseCommand.invoke_with_arguments_async]
+        to await directly).
+
+        Args:
+            arguments (Mapping[str, Any]): Input arguments keyed by parameter name.
+
+        Returns:
+            Any: Return value (or coroutine) produced by the command callable.
+
+        Raises:
+            ValueError: If required arguments are missing or invalid values are supplied.
+            TypeError: If called on a non-executable `CommandGroup`.
+        """
+        if not isinstance(self, Command):
+            raise TypeError(f"Command {self.name!r} is not executable.")
+        values = self._prepare_argument_dict(arguments)
+        return self._invoke_values(values)
+
+    async def invoke_with_arguments_async(self, arguments: Mapping[str, Any]) -> Any:
+        r"""Validate, coerce, and asynchronously execute this command (supporting both sync and `async` commands).
+
+        Args:
+            arguments (Mapping[str, Any]): Input arguments keyed by parameter name.
+
+        Returns:
+            Any: Resolved return value of the command callable.
+        """
+        result = self.invoke_with_arguments(arguments)
+        if inspect.iscoroutine(result):
+            return await result
+        return result
 
     def to_json_schema(self) -> dict[str, Any]:
         r"""Generate a JSON Schema representation of this command and any nested subcommands.
@@ -852,8 +823,8 @@ class BaseCommand(ABC):
         }
         if self.aliases:
             schema["x-clio-aliases"] = list(self.aliases)
-        if self.subcommands:
-            resolved_subs = [_coerce_subcommand(c) for c in self.subcommands]
+        if self.has_subcommands():
+            resolved_subs = self.get_subcommands()
             schema["subcommands"] = {sub.name: sub.to_json_schema() for sub in resolved_subs}
         return schema
 
@@ -912,9 +883,7 @@ class BaseCommand(ABC):
         if self._is_executable():
             bindings.append((self.to_tool(prefix=prefix, command_path=command_path), self))
 
-        for raw_sub in self.subcommands:
-            sub_cmd = _coerce_subcommand(raw_sub)
-            sub_cmd.cli = self.cli
+        for sub_cmd in self.get_subcommands():
             bindings.extend(
                 sub_cmd._iter_tool_bindings(
                     prefix=current_prefix,
@@ -988,17 +957,19 @@ class BaseCommand(ABC):
 class CommandGroup(BaseCommand):
     r"""Base class for branch commands that group nested subcommands without a direct action handler."""
 
+    @override
     def _is_executable(self) -> bool:
         r"""Indicate that a `CommandGroup` requires a child subcommand."""
         return False
 
 
 class Command(BaseCommand, ABC):
-    r"""Strict abstract base class for executable CLI commands.
+    r"""Strict abstract base class for executable synchronous or `async` CLI commands.
 
     Subclasses must implement [`__call__`][clio.command.Command.__call__].
     """
 
+    @override
     def _is_executable(self) -> bool:
         r"""Indicate that this command defines an executable `__call__` handler."""
         return True
@@ -1008,33 +979,92 @@ class Command(BaseCommand, ABC):
         r"""Execute command business logic for parsed arguments.
 
         Args:
-            *args (Any): Positional arguments or `argparse.Namespace`.
-            **kwargs (Any): Keyword arguments mapped from parsed CLI options.
+            *args (Any): Positional arguments mapped from CLI parameters.
+            **kwargs (Any): Keyword arguments mapped from CLI options.
         """
 
-    def _invoke_call(self, parsed_args: argparse.Namespace) -> Any:
-        r"""Dispatch parsed CLI arguments to `self.__call__` via the pre-compiled `CallPlan`."""
-        return type(self).get_spec().call_plan.invoke(self, parsed_args)
+    def _invoke_values(self, values: Mapping[str, Any]) -> Any:
+        r"""Dispatch parsed CLI values to `self.__call__` via the pre-compiled `CallPlan`."""
+        return type(self).get_spec().call_plan.invoke(self, values)
 
-    def _bind_execution(self, spec: CommandSpec) -> None:
-        r"""Auto-populate arguments from `__call__` and bind execution handler on `self.parser`."""
-        assert self.parser is not None
-        plan = spec.call_plan
-        if plan.has_custom_call:
-            if plan.is_namespace_call:
-                DocstringParser.backfill_help(self.parser, spec.docstring_spec.parameters)
-                self.parser.set_defaults(func=self.__call__)
-            else:
-                DocstringParser.populate_parser(self.parser, spec.docstring_spec)
-                self.parser.set_defaults(func=self._invoke_call)
-        else:
-            DocstringParser.backfill_help(self.parser, spec.docstring_spec.parameters)
+    @classmethod
+    def run(
+        cls,
+        args: Sequence[str] | None = None,
+        *,
+        prog: str | None = None,
+        description: str | None = None,
+        epilog: str | None = None,
+        version: str | None = None,
+        catch_exceptions: Iterable[type[Exception]] = (),
+        formatter: HelpFormatter = _DEFAULT_FORMATTER,
+        enable_agent_flags: bool = False,
+        agent_mode: bool | None = None,
+    ) -> Any:
+        r"""Execute this command class directly as a standalone single-command CLI application.
+
+        Args:
+            args (Sequence[str] | None): CLI tokens to parse. Defaults to `sys.argv[1:]`.
+            prog (str | None): Optional program name override.
+            description (str | None): Optional header description override.
+            epilog (str | None): Optional footer epilog text.
+            version (str | None): Optional version string enabling `-v` / `--version`.
+            catch_exceptions (Iterable[type[Exception]]): Domain exception types to trap cleanly.
+            formatter (HelpFormatter): Help formatter specification.
+            enable_agent_flags (bool): Opt in to built-in agent CLI flags (`--json`, `--dry-run`, etc.).
+            agent_mode (bool | None): Override `CLIO_AGENT=1` environment detection.
+
+        Returns:
+            Any: Return value of `__call__`, or `AgentResult` when `--json` / `--dry-run` is active.
+        """
+        from clio.cli import Cli
+
+        return Cli(
+            prog=prog or str(_get_cmd_meta(cls, "name", "") or cls.__name__.lower()),
+            description=description,
+            epilog=epilog,
+            version=version,
+            catch_exceptions=catch_exceptions,
+            formatter=formatter,
+            command=cls,
+            enable_agent_flags=enable_agent_flags,
+            agent_mode=agent_mode,
+        ).run(args)
+
+    @classmethod
+    async def run_async(
+        cls,
+        args: Sequence[str] | None = None,
+        *,
+        prog: str | None = None,
+        description: str | None = None,
+        epilog: str | None = None,
+        version: str | None = None,
+        catch_exceptions: Iterable[type[Exception]] = (),
+        formatter: HelpFormatter = _DEFAULT_FORMATTER,
+        enable_agent_flags: bool = False,
+        agent_mode: bool | None = None,
+    ) -> Any:
+        r"""Asynchronously execute this command class as a standalone single-command CLI on an active event loop."""
+        from clio.cli import Cli
+
+        return await Cli(
+            prog=prog or str(_get_cmd_meta(cls, "name", "") or cls.__name__.lower()),
+            description=description,
+            epilog=epilog,
+            version=version,
+            catch_exceptions=catch_exceptions,
+            formatter=formatter,
+            command=cls,
+            enable_agent_flags=enable_agent_flags,
+            agent_mode=agent_mode,
+        ).run_async(args)
 
     @classmethod
     def from_dataclass(
         cls,
         dc_cls: type[Any],
-        handler: Callable[[Any], None] | None = None,
+        handler: Callable[[Any], Any] | None = None,
         *,
         name: str = "",
         aliases: Sequence[str] = (),
@@ -1045,12 +1075,12 @@ class Command(BaseCommand, ABC):
 
         When the command runs, `clio` instantiates `dc_cls` with the parsed CLI arguments
         and either passes the dataclass instance to `handler(instance)` or invokes `instance()`
-        if the dataclass itself is callable.
+        if the dataclass itself is callable (supporting both sync and `async` callables).
 
         Args:
             dc_cls (type[Any]): Target `@dataclass` type defining CLI fields and docstrings.
-            handler (Callable[[Any], None] | None): Optional callback invoked with the constructed
-                dataclass instance. If omitted, `dc_cls` must implement `__call__`.
+            handler (Callable[[Any], Any] | None): Optional sync or `async` callback invoked with the
+                constructed dataclass instance. If omitted, `dc_cls` must implement `__call__`.
             name (str): Optional override for command name.
             aliases (Sequence[str]): Optional command aliases.
             description (str): Optional override for command description.
@@ -1077,6 +1107,44 @@ class Command(BaseCommand, ABC):
             help_text=help_text,
         )
 
+    @classmethod
+    def from_function(
+        cls,
+        fn: Callable[..., Any],
+        *,
+        name: str = "",
+        aliases: Sequence[str] = (),
+        description: str = "",
+        help_text: str = "",
+    ) -> FunctionCommand:
+        r"""Construct an executable `Command` directly from a standalone synchronous or `async` callable.
+
+        Introspects `fn`'s signature, PEP 649 `__annotate__` hints, PEP 695 `type` aliases,
+        `Annotated[T, Arg(...)]` metadata, nested `@dataclass` parameters, and Google/NumPy
+        docstring into a native `ScanPlan` + `CallPlan` command.
+
+        Args:
+            fn (Callable[..., Any]): Target function, coroutine function, or bound method.
+            name (str): Optional override for command name (defaults to `fn.__name__`).
+            aliases (Sequence[str]): Optional command aliases (defaults to `(fn_name.replace('_', '-'),)`
+                when `fn.__name__` contains underscores).
+            description (str): Optional override for command description.
+            help_text (str): Optional override for short help summary.
+
+        Returns:
+            FunctionCommand: Configured `Command` adapter wrapping `fn`.
+
+        Raises:
+            TypeError: If `fn` is not a standalone callable function or method.
+        """
+        return FunctionCommand(
+            fn=fn,
+            name=name,
+            aliases=aliases,
+            description=description,
+            help_text=help_text,
+        )
+
 
 class DataclassCommand(Command):
     r"""Executable `Command` adapter backed by a `@dataclass` specification."""
@@ -1084,7 +1152,7 @@ class DataclassCommand(Command):
     def __init__(
         self,
         dc_cls: type[Any],
-        handler: Callable[[Any], None] | None = None,
+        handler: Callable[[Any], Any] | None = None,
         *,
         name: str = "",
         aliases: Sequence[str] = (),
@@ -1096,6 +1164,7 @@ class DataclassCommand(Command):
         self._dc_cls = dc_cls
         self._handler = handler
         self._doc_spec = doc_spec
+        self._scan_plan = ScanPlan.compile(doc_spec.specs)
         self._field_names = tuple(f.name for f in dataclasses.fields(dc_cls) if f.init)
 
         self.name = str(name or _get_cmd_meta(dc_cls, "name", "") or dc_cls.__name__.lower())
@@ -1109,27 +1178,100 @@ class DataclassCommand(Command):
         )
         super().__init__()
 
+    @override
+    def get_scan_plan(self) -> ScanPlan:
+        r"""Return the compiled `ScanPlan` for the wrapped `@dataclass`."""
+        return self._scan_plan
+
+    @override
     def get_parameter_specs(self) -> tuple[ParameterSpec, ...]:
         r"""Return the introspected `ParameterSpec` items from the wrapped `@dataclass`."""
         return self._doc_spec.specs
 
-    def resolve_arguments(self, parsed_args: argparse.Namespace) -> dict[str, Any]:
-        r"""Return the bound `@dataclass` field values from `parsed_args`."""
-        raw_values = vars(parsed_args)
-        return {fname: raw_values[fname] for fname in self._field_names if fname in raw_values}
+    @override
+    def resolve_arguments(self, values: Mapping[str, Any]) -> dict[str, Any]:
+        r"""Return the bound `@dataclass` field values from `values`."""
+        return {fname: values[fname] for fname in self._field_names if fname in values}
 
-    def _bind_execution(self, spec: CommandSpec) -> None:
-        r"""Populate `self.parser` from the wrapped `@dataclass` specs and bind execution."""
-        assert self.parser is not None
-        DocstringParser.populate_parser(self.parser, self._doc_spec.specs)
-        DocstringParser.backfill_help(self.parser, self._doc_spec.parameters)
-        self.parser.set_defaults(func=self.__call__)
+    @override
+    def _invoke_values(self, values: Mapping[str, Any]) -> Any:
+        r"""Instantiate the `@dataclass` from parsed values and execute its handler or `__call__`."""
+        return self(**values)
 
-    def __call__(self, args: argparse.Namespace) -> Any:
-        r"""Instantiate the `@dataclass` from parsed CLI arguments and execute its handler."""
-        raw_values = vars(args)
-        dc_kwargs = {fname: raw_values[fname] for fname in self._field_names if fname in raw_values}
+    @override
+    def __call__(self, **values: Any) -> Any:
+        r"""Instantiate the `@dataclass` from keyword values and execute its handler."""
+        dc_kwargs = {fname: values[fname] for fname in self._field_names if fname in values}
         instance = self._dc_cls(**dc_kwargs)
         if self._handler is not None:
             return self._handler(instance)
         return instance()
+
+
+class FunctionCommand(Command):
+    r"""Executable `Command` adapter backed by a standalone synchronous or `async` callable."""
+
+    def __init__(
+        self,
+        fn: Callable[..., Any],
+        *,
+        name: str = "",
+        aliases: Sequence[str] = (),
+        description: str = "",
+        help_text: str = "",
+    ) -> None:
+        r"""Initialize a `FunctionCommand` from a target callable."""
+        if not callable(fn) or isinstance(fn, (type, BaseCommand)):
+            raise TypeError(f"Expected a standalone callable function or method, got {fn!r}")
+
+        unwrapped = inspect.unwrap(fn)
+        raw_name = str(getattr(unwrapped, "__name__", "") or getattr(fn, "__name__", "") or "command")
+        if raw_name == "<lambda>":
+            raw_name = "lambda"
+
+        owner: Any = (
+            fn.__self__
+            if inspect.ismethod(fn) and isinstance(fn.__self__, type)
+            else (type(fn.__self__) if inspect.ismethod(fn) else unwrapped)
+        )
+        doc_spec = DocstringParser.inspect(fn)
+        self._fn = fn
+        self._doc_spec = doc_spec
+        self._scan_plan = ScanPlan.compile(doc_spec.specs)
+        self._call_plan = CallPlan.compile_callable(fn, owner=owner)
+
+        default_aliases: tuple[str, ...] = (
+            (raw_name.replace("_", "-"),) if not name and not aliases and "_" in raw_name else ()
+        )
+        self.name = str(name or raw_name)
+        self.aliases = list(aliases or default_aliases)
+        self.description = str(description or doc_spec.description)
+        self.help_text = str(
+            help_text or doc_spec.help_text or (self.description.strip().split("\n", 1)[0] if self.description else "")
+        )
+        super().__init__()
+
+    @override
+    def get_scan_plan(self) -> ScanPlan:
+        r"""Return the compiled `ScanPlan` for the wrapped callable."""
+        return self._scan_plan
+
+    @override
+    def get_parameter_specs(self) -> tuple[ParameterSpec, ...]:
+        r"""Return the introspected `ParameterSpec` items from the wrapped callable."""
+        return self._doc_spec.specs
+
+    @override
+    def resolve_arguments(self, values: Mapping[str, Any]) -> dict[str, Any]:
+        r"""Return resolved parameter and nested `@dataclass` bindings from `values`."""
+        return self._call_plan.resolve_arguments(values)
+
+    @override
+    def _invoke_values(self, values: Mapping[str, Any]) -> Any:
+        r"""Dispatch parsed CLI values to the wrapped callable via the pre-compiled `CallPlan`."""
+        return self._call_plan.invoke_callable(self._fn, values)
+
+    @override
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        r"""Forward direct Python calls to the wrapped callable."""
+        return self._fn(*args, **kwargs)

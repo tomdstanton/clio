@@ -1,8 +1,11 @@
-r"""Comprehensive test suite for the cliop CLI library."""
+r"""Comprehensive test suite for the clio CLI library."""
 
-import argparse
+import asyncio
+import enum
+import inspect
 import io
 import json
+import runpy
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,13 +35,32 @@ from clio import (
     CommandSpec,
     DocstringParser,
     DocstringSpec,
-    HelpOnErrorParser,
+    FunctionCommand,
+    HelpFormatter,
     McpServer,
+    OptionBinding,
     PackageMeta,
     ParameterSpec,
+    ParseError,
+    ScanPlan,
+    ScanResult,
+    Spinner,
+    SpinnerConfig,
     Style,
+    TargetSpec,
     ToolSpec,
+    build_target_cli,
+    run_target,
+    run_target_async,
+    serialize_for_json,
+    spinner,
 )
+from clio.runner import main as runner_main
+
+# PEP 695 Reusable CLI Type Aliases ------------------------------------------------------------------------------------
+type WorkerCount = Annotated[int, Arg(short="-w", metavar="N", env="PEP695_WORKERS")]
+type OutputFormat = Literal["json", "tsv", "parquet"]
+type TaggedValues[T] = Annotated[list[T], Arg(short="-t", help="Tagged items")]
 
 
 # Fixtures & Helper Commands -------------------------------------------------------------------------------------------
@@ -46,22 +68,32 @@ class CustomDomainError(Exception):
     r"""Dummy domain exception for testing `catch_exceptions`."""
 
 
+@dataclass(frozen=True, slots=True)
+class SharedBranchOpts:
+    r"""Shared options reusable across subcommands via dataclass injection.
+
+    Attributes:
+        shared_flag: Shared branch boolean flag.
+    """
+
+    shared_flag: bool = False
+
+
 class LeafCommand(Command):
     r"""Execute a leaf action.
 
     Detailed multiline description for the leaf command.
+
+    Args:
+        name: Target name.
     """
 
     aliases = ["lf"]
 
-    def setup_arguments(self) -> None:
-        assert self.parser is not None
-        self.parser.add_argument("-n", "--name", default="world", help="Target name")
-
-    def __call__(self, args: argparse.Namespace) -> None:
-        assert self.cli is not None
-        self.cli.msg(f"Running leaf for {args.name}")
-        print(f"Hello, {args.name}!")
+    def __call__(self, name: Annotated[str, Arg(short="-n")] = "world") -> None:
+        if self.cli is not None:
+            self.cli.msg(f"Running leaf for {name}")
+        print(f"Hello, {name}!")
 
 
 class ParentBranchCommand(CommandGroup):
@@ -69,13 +101,8 @@ class ParentBranchCommand(CommandGroup):
 
     name = "branch"
 
-    def get_shared_parser(self) -> argparse.ArgumentParser:
-        shared = HelpOnErrorParser(add_help=False)
-        shared.add_argument("--shared-flag", action="store_true", help="Shared branch flag")
-        return shared
-
     def register_subcommands(self) -> None:
-        self.subcommands.append(LeafCommand())
+        self.add_subcommand(LeafCommand)
 
 
 # 1. Colors Tests ------------------------------------------------------------------------------------------------------
@@ -99,7 +126,6 @@ def test_colors_wrap_enabled_and_disabled(monkeypatch: pytest.MonkeyPatch) -> No
 def test_colors_ergonomic_helpers_and_advanced_palettes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(Colors, "ENABLED", True)
 
-    # Shorthand style & color helpers
     assert Colors.bold("hi") == f"{Colors.BOLD}hi{Colors.RESET}"
     assert Colors.dim("hi") == f"{Colors.DIM}hi{Colors.RESET}"
     assert Colors.italic("hi") == f"{Colors.ITALIC}hi{Colors.RESET}"
@@ -115,18 +141,15 @@ def test_colors_ergonomic_helpers_and_advanced_palettes(monkeypatch: pytest.Monk
     assert Colors.white("txt") == f"{Colors.WHITE}txt{Colors.RESET}"
     assert Colors.gray("dimmed") == f"{Colors.GRAY}dimmed{Colors.RESET}"
 
-    # Semantic presets
     assert Colors.success("done") == f"{Colors.BOLD_GREEN}done{Colors.RESET}"
     assert Colors.warning("careful") == f"{Colors.BOLD_YELLOW}careful{Colors.RESET}"
     assert Colors.error("failed") == f"{Colors.BOLD_RED}failed{Colors.RESET}"
     assert Colors.info("note") == f"{Colors.BOLD_CYAN}note{Colors.RESET}"
     assert Colors.muted("subtle") == f"{Colors.DIM}subtle{Colors.RESET}"
 
-    # Declarative style() builder
     composed = Colors.style("alert", fg=Colors.RED, bg=Colors.BG_WHITE, bold=True, underline=True)
     assert composed == f"{Colors.BOLD}{Colors.UNDERLINE}{Colors.RED}{Colors.BG_WHITE}alert{Colors.RESET}"
 
-    # 256-color, RGB, and Hex builders
     assert Colors.fg256(208) == "\033[38;5;208m"
     assert Colors.bg256(235) == "\033[48;5;235m"
     assert Colors.rgb(255, 85, 0) == "\033[38;2;255;85;0m"
@@ -141,12 +164,10 @@ def test_colors_ergonomic_helpers_and_advanced_palettes(monkeypatch: pytest.Monk
     with pytest.raises(ValueError, match="Invalid hex"):
         Colors.hex("#zzzzzz")
 
-    # Strip & visible_len
     assert Colors.strip_ansi(composed) == "alert"
     assert Colors.visible_len(composed) == 5
     assert Colors.strip_ansi("no ansi") == "no ansi"
 
-    # Frozen slotted Style dataclass & composition
     base_style = Style(fg=Colors.CYAN, bold=True)
     accent_style = base_style | Style(underline=True)
     assert accent_style("header") == f"{Colors.BOLD}{Colors.UNDERLINE}{Colors.CYAN}header{Colors.RESET}"
@@ -154,30 +175,37 @@ def test_colors_ergonomic_helpers_and_advanced_palettes(monkeypatch: pytest.Monk
         base_style.bold = False  # type: ignore
 
 
-# 2. Formatter & Parser Tests ------------------------------------------------------------------------------------------
-def test_color_help_formatter_replaces_subcommands_and_injects_options(
+# 2. HelpFormatter & Native Parser Tests -------------------------------------------------------------------------------
+def test_help_formatter_renders_clean_synopsis_and_sections(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(Colors, "ENABLED", False)
-    cli = Cli(prog="mytool", description="Top level tool", version="1.2.3")
-    cli.add_command(LeafCommand())
+    cli = Cli(
+        prog="mytool",
+        description="Top level tool",
+        epilog="Footer note.",
+        version="1.2.3",
+        formatter=HelpFormatter(max_width=80, col_width=26),
+    )
+    cli.add_command(LeafCommand)
 
-    help_output = cli.parser.format_help()
+    help_output = cli.format_help()
 
-    # Checks that usage has [options] and [subcommand] instead of {leafcommand,lf}
     assert "usage: mytool [options] [subcommand]" in help_output
     assert "{leafcommand" not in help_output
+    assert "Top level tool" in help_output
     assert "🌎 Global options:" in help_output
     assert "💬 Commands:" in help_output
+    assert "leafcommand (lf)" in help_output
+    assert "Footer note." in help_output
 
 
-def test_help_on_error_parser_fuzzy_match_suggestion(
+def test_parse_error_fuzzy_subcommand_suggestion(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(Colors, "ENABLED", False)
-    cli = Cli(prog="mytool")
-    cli.add_command(LeafCommand())
+    cli = Cli(prog="mytool", commands=[LeafCommand])
 
     with pytest.raises(SystemExit) as exc_info:
         cli.run(["leafcomman"])  # Typo of 'leafcommand'
@@ -197,9 +225,7 @@ def test_command_metadata_auto_population() -> None:
     assert "Detailed multiline description" in cmd.description
 
 
-def test_nested_subcommands_and_shared_parser_inheritance(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+def test_nested_subcommands_and_shared_dataclass_composition() -> None:
     received_args: dict[str, Any] = {}
 
     class InspectLeaf(Command):
@@ -207,16 +233,19 @@ def test_nested_subcommands_and_shared_parser_inheritance(
 
         name = "inspect"
 
-        def __call__(self, args: argparse.Namespace) -> None:
-            received_args["verbose"] = args.verbose
-            received_args["shared_flag"] = args.shared_flag
+        def __call__(self, shared: SharedBranchOpts) -> None:
+            assert self.cli is not None
+            received_args["verbose"] = self.cli.verbose
+            received_args["shared_flag"] = shared.shared_flag
 
-    class CustomBranch(ParentBranchCommand):
-        def register_subcommands(self) -> None:
-            self.subcommands.append(InspectLeaf())
+    class CustomBranch(CommandGroup):
+        """Custom nested branch."""
+
+        name = "branch"
+        subcommands = [InspectLeaf]
 
     with Cli(prog="mytool") as app:
-        app.add_command(CustomBranch())
+        app.add_command(CustomBranch)
         app.run(["branch", "inspect", "-V", "--shared-flag"])
 
     assert received_args["verbose"] is True
@@ -227,8 +256,7 @@ def test_nested_subcommands_and_shared_parser_inheritance(
 def test_branch_command_without_call_requires_subcommand(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    with Cli(prog="mytool") as app:
-        app.add_command(ParentBranchCommand())
+    with Cli(prog="mytool", commands=[ParentBranchCommand]) as app:
         with pytest.raises(SystemExit) as exc_info:
             app.run(["branch"])
 
@@ -237,17 +265,13 @@ def test_branch_command_without_call_requires_subcommand(
 
 
 def test_version_flag_optional_registration(capsys: pytest.CaptureFixture[str]) -> None:
-    # 1. With version provided
-    cli_with_ver = Cli(prog="mytool", version="0.5.0")
-    cli_with_ver.add_command(LeafCommand())
+    cli_with_ver = Cli(prog="mytool", version="0.5.0", commands=[LeafCommand])
     with pytest.raises(SystemExit) as exc_info:
         cli_with_ver.run(["--version"])
     assert exc_info.value.code == 0
     assert "mytool 0.5.0" in capsys.readouterr().out
 
-    # 2. Without version provided (-v should fail as unrecognized)
-    cli_no_ver = Cli(prog="mytool")
-    cli_no_ver.add_command(LeafCommand())
+    cli_no_ver = Cli(prog="mytool", commands=[LeafCommand])
     with pytest.raises(SystemExit) as exc_info:
         cli_no_ver.run(["-v"])
     assert exc_info.value.code == 2
@@ -260,25 +284,18 @@ def test_catch_cli_error_and_custom_exceptions(capsys: pytest.CaptureFixture[str
 
         name = "fail"
 
-        def setup_arguments(self) -> None:
-            assert self.parser is not None
-            self.parser.add_argument("--mode", choices=["cli", "domain"], default="cli")
-
-        def __call__(self, args: argparse.Namespace) -> None:
-            if args.mode == "cli":
+        def __call__(self, mode: Literal["cli", "domain"] = "cli") -> None:
+            if mode == "cli":
                 raise CliError("Custom CLI failure", exit_code=42)
             raise CustomDomainError("Database connection dropped")
 
-    cli = Cli(prog="mytool", catch_exceptions=(CustomDomainError,))
-    cli.add_command(FailingCommand())
+    cli = Cli(prog="mytool", catch_exceptions=(CustomDomainError,), commands=[FailingCommand])
 
-    # Test built-in CliError with custom exit code
     with pytest.raises(SystemExit) as exc_info:
         cli.run(["fail", "--mode", "cli"])
     assert exc_info.value.code == 42
     assert "❌ Custom CLI failure" in capsys.readouterr().err
 
-    # Test custom domain exception via catch_exceptions
     with pytest.raises(SystemExit) as exc_info:
         cli.run(["fail", "--mode", "domain"])
     assert exc_info.value.code == 1
@@ -315,13 +332,11 @@ def test_open_file_tracking_and_cleanup(tmp_path: Path) -> None:
         handle = app.open_file(test_file, mode="w")
         handle.write("data")
         assert not handle.closed
-        # Ensure stdout/stdout.buffer are returned cleanly and never closed on exit
         stdout_handle = app.open_file("-", mode="w")
         stdout_bin_handle = app.open_file("stdout", mode="wb")
         assert stdout_handle is sys.stdout
         assert stdout_bin_handle is sys.stdout.buffer
 
-    # Exiting context manager must close tracked file handle, but keep sys.stdout open
     assert handle.closed
     assert not sys.stdout.closed
     assert not sys.stdout.buffer.closed
@@ -331,14 +346,12 @@ def test_open_file_tracking_and_cleanup(tmp_path: Path) -> None:
 def test_verbose_msg_and_progress_reporting(capsys: pytest.CaptureFixture[str]) -> None:
     cli = Cli(prog="mytool")
 
-    # Silent when verbose=False
     cli.verbose = False
     cli.msg("Hidden log")
     items = list(cli.progress([1, 2, 3], "Processing"))
     assert items == [1, 2, 3]
     assert capsys.readouterr().err == ""
 
-    # Emits to stderr when verbose=True (including generator without __len__)
     cli.verbose = True
     cli.msg("Visible log")
     gen_items = list(cli.progress((x for x in range(2)), "Streaming"))
@@ -402,7 +415,6 @@ def test_docstring_parser_google_and_numpy_mro_extraction() -> None:
 
 
 def test_command_auto_introspects_call_signature_and_types(
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(Colors, "ENABLED", False)
@@ -451,14 +463,13 @@ def test_command_auto_introspects_call_signature_and_types(
     assert "Runs the processing pipeline" in cmd.description
     assert "Args:" not in cmd.description
 
-    cli = Cli(prog="mytool")
-    cli.add_command(cmd)
+    cli = Cli(prog="mytool", commands=[cmd])
 
-    assert cmd.parser is not None
-    help_text = cmd.parser.format_help()
+    help_text = cmd.format_help(prog_prefix="mytool")
     assert "Path to input file." in help_text
     assert "Execution mode selector." in help_text
     assert "--no-cache" in help_text
+    assert "--no-dry-run" not in help_text  # Default is False, so --no-dry-run is hidden in help
 
     cli.run(
         [
@@ -488,7 +499,7 @@ def test_command_auto_introspects_call_signature_and_types(
     }
 
 
-def test_hybrid_setup_arguments_and_docstring_help_backfill(
+def test_annotated_short_flags_and_docstring_help_backfill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(Colors, "ENABLED", False)
@@ -504,22 +515,18 @@ def test_hybrid_setup_arguments_and_docstring_help_backfill(
 
         name = "hybrid"
 
-        def setup_arguments(self) -> None:
-            assert self.parser is not None
-            # Explicitly register short flag -n/--name without a help string
-            self.parser.add_argument("-n", "--name", default="default-name")
-
-        def __call__(self, name: str = "default-name", retries: int = 3) -> None:
+        def __call__(
+            self,
+            name: Annotated[str, Arg(short="-n")] = "default-name",
+            retries: int = 3,
+        ) -> None:
             captured["name"] = name
             captured["retries"] = retries
 
     cmd = HybridCommand()
-    cli = Cli(prog="mytool")
-    cli.add_command(cmd)
+    cli = Cli(prog="mytool", commands=[cmd])
 
-    assert cmd.parser is not None
-    help_out = cmd.parser.format_help()
-    # Help for -n/--name was back-filled from docstring, and --retries was auto-generated
+    help_out = cmd.format_help(prog_prefix="mytool")
     assert "-n, --name" in help_out
     assert "Documented name help from docstring." in help_out
     assert "--retries" in help_out
@@ -527,44 +534,6 @@ def test_hybrid_setup_arguments_and_docstring_help_backfill(
 
     cli.run(["hybrid", "-n", "custom", "--retries", "5"])
     assert captured == {"name": "custom", "retries": 5}
-
-
-def test_add_arguments_from_external_class_and_callable() -> None:
-    class ServerConfig:  # noqa: B903
-        """Server configuration parameters.
-
-        Args:
-            host (str): Bind hostname.
-            port (int): Listen port number.
-        """
-
-        def __init__(self, host: str = "127.0.0.1", port: int = 8000) -> None:
-            self.host = host
-            self.port = port
-
-    captured: dict[str, Any] = {}
-
-    class ServeCommand(Command):
-        """Start server using external config class."""
-
-        name = "serve"
-
-        def setup_arguments(self) -> None:
-            self.add_arguments_from(ServerConfig)
-
-        def __call__(self, **kwargs: Any) -> None:
-            captured.update(kwargs)
-
-    cli = Cli(prog="mytool")
-    cli.add_command(ServeCommand())
-    cli.run(["serve", "--host", "0.0.0.0", "--port", "9090"])
-
-    assert captured["host"] == "0.0.0.0"
-    assert captured["port"] == 9090
-    spec_obj = ParameterSpec(name="x", annotation=int, default=1)
-    assert isinstance(spec_obj, ParameterSpec)
-    with pytest.raises(AttributeError):
-        spec_obj.name = "y"  # type: ignore
 
 
 def test_stateless_class_registration_and_frozen_specs(
@@ -579,9 +548,10 @@ def test_stateless_class_registration_and_frozen_specs(
     spec = LeafCommand.get_spec()
     assert isinstance(spec, CommandSpec)
     assert isinstance(spec.call_plan, CallPlan)
+    assert isinstance(spec.scan_plan, ScanPlan)
     assert isinstance(spec.docstring_spec, DocstringSpec)
     assert spec.call_plan.has_custom_call is True
-    assert spec.call_plan.is_namespace_call is True
+    assert spec.call_plan.is_async is False
 
     cli = Cli(prog="mytool", commands=[DeclarativeBranch])
     assert isinstance(cli.config, CliConfig)
@@ -598,6 +568,9 @@ def test_strict_abc_enforcement_on_command_and_base_command() -> None:
 
     with pytest.raises(TypeError, match="abstract"):
         BaseCommand()  # type: ignore
+
+    with pytest.raises(TypeError, match="abstract"):
+        Cli(prog="bad", commands=[IncompleteCommand])
 
 
 def test_dataclass_command_generation_and_injection(
@@ -644,7 +617,6 @@ def test_dataclass_command_generation_and_injection(
         def __call__(self, dataset: Path, opt: OptimizerSpec, *, dry_run: bool = False) -> None:
             executed.append((dataset, opt, dry_run))
 
-    # 1. Direct registration of callable @dataclass(frozen=True, slots=True)
     cli = Cli(prog="mltool", commands=[TrainJob, TuneCommand])
     cli.run(["train", "data/train.parquet", "--epochs", "20", "--tags", "v1", "fast"])
 
@@ -655,7 +627,6 @@ def test_dataclass_command_generation_and_injection(
     assert job.epochs == 20
     assert job.tags == ["v1", "fast"]
 
-    # 2. Automatic @dataclass parameter expansion & instantiation in Command.__call__
     cli.run(["tune", "data/val.parquet", "--lr", "0.05", "--dry-run"])
     assert len(executed) == 2
     ds, opt, dry = executed[1]
@@ -663,7 +634,6 @@ def test_dataclass_command_generation_and_injection(
     assert opt == OptimizerSpec(lr=0.05, weight_decay=0.01)
     assert dry is True
 
-    # 3. Command.from_dataclass with an external handler function
     handled: list[OptimizerSpec] = []
     opt_cmd = Command.from_dataclass(OptimizerSpec, handler=handled.append, name="opt")
     cli.add_command(opt_cmd)
@@ -694,7 +664,7 @@ def test_zero_dependency_markdown_documentation_generation() -> None:
         commands=[DeployCommand, ParentBranchCommand],
     )
 
-    md = cli.to_markdown()
+    md = cli.to_markdown(include_global_options=True)
     assert "# `cloudctl`" in md
     assert "Cloud control plane CLI." in md
     assert "**Global Options**" in md
@@ -707,7 +677,6 @@ def test_zero_dependency_markdown_documentation_generation() -> None:
     assert "### `cloudctl branch leafcommand`" in md
     assert "Built with clio." in md
 
-    # Standalone unbuilt command markdown generation
     standalone_md = DeployCommand().to_markdown()
     assert "## `deploy`" in standalone_md
     assert "`--replicas`" in standalone_md
@@ -729,66 +698,341 @@ def test_importlib_metadata_auto_populates_cli(
     assert exc_info.value.code == 0
     assert f"pytest {app.config.version}" in capsys.readouterr().out
 
-    # Non-existent package gracefully resolves to None
     assert PackageMeta.resolve("nonexistent-package-xyz-999") is None
+    assert PackageMeta.resolve("") is None
 
 
-def test_annotationlib_annotated_arg_metadata_and_forwardref_resilience(
+# 7. Python 3.14 annotationlib, PEP 649 Lazy __annotate__ & PEP 695 Type Aliases --------------------------------------
+def test_pep649_lazy_annotate_preserved_across_registration_help_and_routing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(Colors, "ENABLED", False)
+    annotate_evals = 0
+
+    def _track_annotate_eval() -> type[int]:
+        nonlocal annotate_evals
+        annotate_evals += 1
+        return int
+
+    class UntouchedTrackedCmd(Command):
+        """Command whose PEP 649 __annotate__ tracks evaluation count."""
+
+        name = "tracked"
+        aliases = ["tr"]
+
+        def __call__(self, value: _track_annotate_eval()) -> int:  # type: ignore
+            return value + 1
+
+    ran_safe = False
+
+    class SafeNeighborCmd(Command):
+        """Safe command that runs without touching siblings."""
+
+        name = "safe"
+
+        def __call__(self, count: int = 1) -> int:
+            nonlocal ran_safe
+            ran_safe = True
+            return count * 2
+
+    # 1. Registration must NOT evaluate UntouchedTrackedCmd.__call__.__annotate__
+    cli = Cli(prog="lazytool", commands=[UntouchedTrackedCmd, SafeNeighborCmd])
+    assert annotate_evals == 0
+
+    # 2. Root --help rendering must NOT evaluate UntouchedTrackedCmd.__call__.__annotate__
+    help_text = cli.format_help()
+    assert "tracked (tr)" in help_text
+    assert "Command whose PEP 649 __annotate__ tracks evaluation count." in help_text
+    assert annotate_evals == 0
+
+    # 3. Routing and running a sibling command must NOT evaluate UntouchedTrackedCmd.__call__.__annotate__
+    assert cli.run(["safe", "--count", "4"]) == 8
+    assert ran_safe is True
+    assert annotate_evals == 0
+
+    # 4. Invoking the tracked command evaluates __annotate__ exactly once and caches CommandSpec
+    assert cli.run(["tracked", "10"]) == 11
+    assert annotate_evals == 1
+    assert cli.run(["tr", "20"]) == 21
+    assert annotate_evals == 1
+
+
+def test_pep695_type_aliases_and_nested_forward_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PEP695_WORKERS", "12")
     monkeypatch.setenv("CLIO_TEST_TOKEN", "secret-token-42")
-    monkeypatch.setenv("CLIO_TEST_WORKERS", "12")
     captured: dict[str, Any] = {}
 
-    class ServeCommand(Command):
-        """Start worker server.
+    type OptionalPair[T] = tuple[T, T] | None
+
+    class PipelineCommand(Command):
+        """Run pipeline using PEP 695 type aliases and forward-referenced types.
 
         Args:
             workers: Docstring fallback description for workers.
         """
 
-        name = "serve"
+        name = "pipe"
 
         def __call__(
             self,
+            stage: Annotated[LaterStageConfig, "Deferred stage config"],
             host: Annotated[str, Arg(positional=True, metavar="HOST"), "Bind hostname"] = "127.0.0.1",
-            workers: Annotated[int, Arg(short="-w", metavar="N", env="CLIO_TEST_WORKERS")] = 4,
-            token: Annotated[str, Arg(short="-t", env="CLIO_TEST_TOKEN", help="Auth token")] = "",
-            mode: Annotated[str, Arg(short=("-m", "--server-mode"), choices=("fast", "safe"))] = "fast",
+            workers: WorkerCount = 4,
+            fmt: OutputFormat = "json",
+            tags: TaggedValues[int] = [],  # noqa: B006
+            bounds: OptionalPair[float] = None,
+            level: LaterLevelEnum | None = None,
+            token: Annotated[str, Arg(short="-k", env="CLIO_TEST_TOKEN", help="Auth token")] = "",
             context: UnresolvedFutureType | None = None,
         ) -> None:
-            captured["host"] = host
-            captured["workers"] = workers
-            captured["token"] = token
-            captured["mode"] = mode
-            captured["context"] = context
+            captured.update(
+                stage=stage,
+                host=host,
+                workers=workers,
+                fmt=fmt,
+                tags=tags,
+                bounds=bounds,
+                level=level,
+                token=token,
+                context=context,
+            )
 
-    cli = Cli(prog="srv", commands=[ServeCommand])
-    cli.run(["serve", "-m", "safe"])
+    @dataclass(frozen=True, slots=True)
+    class LaterStageConfig:
+        """Defined AFTER PipelineCommand to exercise nested PEP 649 ForwardRef resolution."""
+
+        batch_size: int = 64
+
+    class LaterLevelEnum(enum.Enum):
+        LOW = "low"
+        HIGH = "high"
+
+    cli = Cli(prog="srv", commands=[PipelineCommand])
+    cli.run(
+        [
+            "pipe",
+            "--fmt",
+            "parquet",
+            "-t",
+            "10",
+            "20",
+            "--bounds",
+            "-1.5",
+            "2.5",
+            "--level",
+            "high",
+            "--batch-size",
+            "128",
+        ]
+    )
 
     assert captured == {
+        "stage": LaterStageConfig(batch_size=128),
         "host": "127.0.0.1",
         "workers": 12,
+        "fmt": "parquet",
+        "tags": [10, 20],
+        "bounds": (-1.5, 2.5),
+        "level": LaterLevelEnum.HIGH,
         "token": "secret-token-42",
-        "mode": "safe",
         "context": None,
     }
 
-    # Short flags override env defaults cleanly
-    cli.run(["serve", "0.0.0.0", "-w", "32", "-t", "override"])
+    cli.run(["pipe", "0.0.0.0", "-w=32", "-k", "override"])
     assert captured["host"] == "0.0.0.0"
     assert captured["workers"] == 32
     assert captured["token"] == "override"
 
+    schema = cli.to_json_schema()
+    pipe_props = schema["commands"]["pipe"]["properties"]
+    assert pipe_props["fmt"]["enum"] == ["json", "tsv", "parquet"]
+    assert pipe_props["tags"]["items"] == {"type": "integer"}
+    assert pipe_props["level"]["enum"] == ["low", "high"]
+
     md = cli.to_markdown()
     assert "`-w`, `--workers`" in md
-    assert "`[env: CLIO_TEST_WORKERS]`" in md or "[env: CLIO_TEST_WORKERS]" in md
+    assert "[env: PEP695_WORKERS]" in md
     assert "Docstring fallback description for workers." in md
     assert "Auth token" in md
     assert "Bind hostname" in md
 
 
-# 7. Agentic Coding, Schema, SKILL.md, Dry-Run & MCP Tests -------------------------------------------------------------
+# 8. Native Scanner Strict Semantics, Tuples, Negatives & Single-Command Mode -----------------------------------------
+def test_native_scanner_strict_semantics_tuples_negatives_and_bool_overrides(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Colors, "ENABLED", False)
+    monkeypatch.setenv("FORCE_CACHE_ENV", "true")
+
+    class Priority(enum.Enum):
+        LOW = 1
+        HIGH = 2
+
+    class ComputeCmd(Command):
+        """Run numeric & tuple parsing checks."""
+
+        name = "compute"
+
+        def __call__(
+            self,
+            label: str,
+            offset: Annotated[float, Arg(positional=True)] = 0.0,
+            *,
+            delta: float = 0.0,
+            coords: tuple[float, float] = (0.0, 0.0),
+            endpoint: tuple[str, int] = ("localhost", 8080),
+            nums: Annotated[list[int], Arg(short="-n")] = [],  # noqa: B006
+            cache: Annotated[bool, Arg(env="FORCE_CACHE_ENV")] = False,
+            priority: Priority = Priority.LOW,
+        ) -> dict[str, Any]:
+            return {
+                "label": label,
+                "offset": offset,
+                "delta": delta,
+                "coords": coords,
+                "endpoint": endpoint,
+                "nums": nums,
+                "cache": cache,
+                "priority": priority,
+            }
+
+    cli = Cli(prog="calc", commands=[ComputeCmd])
+
+    # 1. Negative positional numbers, negative option/tuple/variadic values, repeated flags, --no-cache overriding env,
+    #    --flag=val, Enum by member name, and `--` sentinel for leading-dash positional strings
+    res = cli.run(
+        [
+            "compute",
+            "--delta",
+            "-9.5",
+            "--coords",
+            "-12.5",
+            "-.25",
+            "--endpoint",
+            "db.local",
+            "5432",
+            "-n",
+            "-1",
+            "-2",
+            "-n=3",
+            "--no-cache",
+            "--priority=HIGH",
+            "--",
+            "--dash-label",
+            "-42.5",
+        ]
+    )
+    assert res == {
+        "label": "--dash-label",
+        "offset": -42.5,
+        "delta": -9.5,
+        "coords": (-12.5, -0.25),
+        "endpoint": ("db.local", 5432),
+        "nums": [-1, -2, 3],
+        "cache": False,
+        "priority": Priority.HIGH,
+    }
+
+    # Negative positional float passed directly WITHOUT `--` sentinel
+    res_neg_pos = cli.run(["compute", "plain", "-3.25"])
+    assert res_neg_pos["offset"] == -3.25
+
+    # 2. Explicit --cache=false also overrides truthy env variable
+    res2 = cli.run(["compute", "item", "--cache=false"])
+    assert res2["cache"] is False
+
+    # 3. --no-cache=true is rejected
+    with pytest.raises(SystemExit) as exc_info:
+        cli.run(["compute", "item", "--no-cache=true"])
+    assert exc_info.value.code == 2
+    assert "ignored explicit argument" in capsys.readouterr().err
+
+    # 4. Wrong fixed-tuple arity raises ParseError
+    with pytest.raises(SystemExit) as exc_info:
+        cli.run(["compute", "item", "--coords", "1.0"])
+    assert exc_info.value.code == 2
+    assert "expected 2 arguments" in capsys.readouterr().err
+
+    # 5. Attached short value (-n5) is strictly rejected with fuzzy suggestion
+    with pytest.raises(SystemExit) as exc_info:
+        cli.run(["compute", "item", "-n5"])
+    assert exc_info.value.code == 2
+    err_out = capsys.readouterr().err
+    assert "unrecognized arguments: -n5" in err_out
+    assert "Did you mean '-n'?" in err_out
+
+
+def test_single_command_execution_and_hybrid_command_routing(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Colors, "ENABLED", False)
+
+    class SingleEcho(Command):
+        """Standalone echo utility."""
+
+        name = "echo"
+
+        def __call__(self, text: str, *, times: Annotated[int, Arg(short="-t")] = 1) -> str:
+            return " ".join([text] * times)
+
+    # 1. Direct Command.run() convenience entry point
+    assert SingleEcho.run(["hi", "-t", "3"]) == "hi hi hi"
+
+    # 2. Single-command Cli(command=...) with version, help, markdown, schema, skill, dry-run, and MCP
+    single_cli = Cli(
+        prog="echoctl",
+        version="3.1.0",
+        epilog="Single mode epilog.",
+        command=SingleEcho,
+        enable_agent_flags=True,
+    )
+    assert "usage: echoctl [options] TEXT" in single_cli.format_help()
+    assert "# `echoctl`" in single_cli.to_markdown()
+    assert single_cli.to_json_schema()["commands"]["echo"]["required"] == ["text"]
+    assert "name: echoctl" in single_cli.to_skill_md()
+
+    dry = single_cli.run(["hello", "-t", "2", "--dry-run"])
+    assert isinstance(dry, AgentResult)
+    assert dry.arguments == {"text": "hello", "times": 2}
+    capsys.readouterr()
+
+    mcp_res = McpServer(single_cli).call_tool("echo", {"text": "mcp", "times": 2})
+    assert mcp_res.ok is True
+    assert mcp_res.result == "mcp mcp"
+
+    with pytest.raises(ValueError, match="Cannot specify both"):
+        Cli(command=SingleEcho, commands=[LeafCommand])
+    with pytest.raises(ValueError, match="Cannot add subcommands"):
+        single_cli.add_command(LeafCommand)
+
+    # 3. Hybrid Command (both executable directly AND hosting child subcommands)
+    class ServiceStatusCmd(Command):
+        """Inspect service status."""
+
+        name = "status"
+
+        def __call__(self) -> str:
+            return "healthy"
+
+    class ServiceHybridCmd(Command):
+        """Run service or a service subcommand."""
+
+        name = "service"
+        subcommands = [ServiceStatusCmd]
+
+        def __call__(self, port: int = 8080) -> str:
+            return f"serving:{port}"
+
+    hybrid_cli = Cli(prog="svc", commands=[ServiceHybridCmd])
+    assert hybrid_cli.run(["service", "--port", "9000"]) == "serving:9000"
+    assert hybrid_cli.run(["service", "status"]) == "healthy"
+
+
+# 9. Agentic Coding, Schema, SKILL.md, Dry-Run & MCP Tests ------------------------------------------------------------
 def test_schema_tool_and_skill_generation() -> None:
     class DeployCommand(Command):
         """Deploy service to target environment.
@@ -866,7 +1110,6 @@ def test_clio_agent_env_mode_concise_errors_and_no_spinners(
     cli = Cli(prog="agenttool", commands=[WorkCommand])
     assert cli.agent_mode is True
 
-    # 1. Typo in flag produces fuzzy suggestion and concise error (without full help dump)
     with pytest.raises(SystemExit) as exc_info:
         cli.run(["work", "--coun", "5"])
     assert exc_info.value.code == 2
@@ -875,7 +1118,6 @@ def test_clio_agent_env_mode_concise_errors_and_no_spinners(
     assert "Run 'agenttool work --help' for full help." in stderr
     assert "🌎 Global options" not in stderr
 
-    # 2. Progress in verbose agent mode emits a single summary line without \r frames
     cli.run(["-V", "work", "--count", "3"])
     stderr_progress = capsys.readouterr().err
     assert "Working (3)" in stderr_progress
@@ -910,7 +1152,6 @@ def test_opt_in_agent_flags_json_dry_run_and_introspection(
 
     cli = Cli(prog="builder", version="1.0.0", commands=[BuildCommand], enable_agent_flags=True)
 
-    # 1. --dry-run resolves CallPlan bindings without running BuildCommand.__call__
     dry_res = cli.run(["build", "dist/app.whl", "--replicas", "4", "--dry-run"])
     assert isinstance(dry_res, AgentResult)
     assert dry_res.ok is True
@@ -920,7 +1161,6 @@ def test_opt_in_agent_flags_json_dry_run_and_introspection(
     assert dry_payload["dry_run"] is True
     assert dry_payload["arguments"] == {"target": "dist/app.whl", "replicas": 4, "fail": False}
 
-    # 2. --json wraps return value and captures stdout + verbose cli.msg
     ok_res = cli.run(["-V", "build", "dist/app.whl", "--replicas", "3", "--json"])
     assert isinstance(ok_res, AgentResult)
     assert len(executed) == 1
@@ -936,7 +1176,6 @@ def test_opt_in_agent_flags_json_dry_run_and_introspection(
     err_spec = AgentErrorSpec(message="Build failed cleanly", exit_code=9)
     assert err_spec.to_dict() == {"message": "Build failed cleanly", "exit_code": 9}
 
-    # 3. --json on CliError emits structured error envelope and exits with custom code
     with pytest.raises(SystemExit) as exc_info:
         cli.run(["build", "dist/app.whl", "--fail", "--json"])
     assert exc_info.value.code == 9
@@ -945,7 +1184,6 @@ def test_opt_in_agent_flags_json_dry_run_and_introspection(
     assert err_payload["error"]["message"] == "Build failed cleanly"
     assert err_payload["error"]["exit_code"] == 9
 
-    # 4. --schema and --skill flags exit 0 with structured output
     with pytest.raises(SystemExit) as exc_info:
         cli.run(["--schema"])
     assert exc_info.value.code == 0
@@ -978,7 +1216,6 @@ def test_mcp_server_json_rpc_lifecycle() -> None:
     cli = Cli(prog="calc", version="0.2.0", commands=[SumTask, ParentBranchCommand])
     server = McpServer(cli)
 
-    # 1. initialize, tools/list, tools/call via stdio stream
     requests = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
@@ -1002,7 +1239,7 @@ def test_mcp_server_json_rpc_lifecycle() -> None:
     server.serve(stdin=in_stream, stdout=out_stream)
     responses = [json.loads(line) for line in out_stream.getvalue().splitlines() if line.strip()]
 
-    assert len(responses) == 4  # Notification produces no response
+    assert len(responses) == 4
     assert responses[0]["result"]["serverInfo"]["name"] == "calc"
     listed_names = [t["name"] for t in responses[1]["result"]["tools"]]
     assert listed_names == ["sum", "branch_leafcommand"]
@@ -1016,14 +1253,189 @@ def test_mcp_server_json_rpc_lifecycle() -> None:
     assert {"level": "stdout", "text": "Hello, agent!"} in leaf_res["structuredContent"]["messages"]
 
 
-def test_extended_coverage_color_docstr_command_agent_and_cli(
+# 10. Opt-In Async Execution & Spinner Tests ---------------------------------------------------------------------------
+def test_async_commands_run_and_run_async_and_mcp(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class AsyncFetchCommand(Command):
+        """Fetch remote items concurrently."""
+
+        name = "fetch"
+
+        async def __call__(self, urls: list[str], *, fail: bool = False) -> list[str]:
+            async def _one(u: str) -> str:
+                await asyncio.sleep(0)
+                return u.upper()
+
+            if fail:
+                raise CliError("Async fetch failed", exit_code=17)
+
+            async with asyncio.TaskGroup() as tg:
+                tasks = [tg.create_task(_one(u)) for u in urls]
+            return [t.result() for t in tasks]
+
+    @dataclass(frozen=True, slots=True)
+    class AsyncJobSpec:
+        """Async callable dataclass command."""
+
+        name: str = field(default="job", init=False)
+        item: str
+
+        async def __call__(self) -> str:
+            await asyncio.sleep(0)
+            return f"done:{self.item}"
+
+    assert AsyncFetchCommand.get_spec().call_plan.is_async is True
+    assert LeafCommand.get_spec().call_plan.is_async is False
+
+    cli = Cli(prog="asynctool", commands=[AsyncFetchCommand, AsyncJobSpec], enable_agent_flags=True)
+
+    # 1. Synchronous Cli.run() lazily runs coroutine via asyncio.run()
+    assert cli.run(["fetch", "a", "b"]) == ["A", "B"]
+    assert cli.run(["job", "payload"]) == "done:payload"
+
+    # 2. --json mode with async command (success and caught CliError)
+    ok_env = cli.run(["fetch", "x", "--json"])
+    assert isinstance(ok_env, AgentResult)
+    assert ok_env.result == ["X"]
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.run(["fetch", "x", "--fail", "--json"])
+    assert exc_info.value.code == 17
+    err_payload = json.loads(capsys.readouterr().out)
+    assert err_payload["error"]["message"] == "Async fetch failed"
+
+    # 3. McpServer.call_tool() (sync) on async command
+    mcp = McpServer(cli)
+    sync_tool_res = mcp.call_tool("fetch", {"urls": ["m1", "m2"]})
+    assert sync_tool_res.ok is True
+    assert sync_tool_res.result == ["M1", "M2"]
+
+    # 4. Native async host execution via Cli.run_async, Command.run_async, and McpServer.call_tool_async
+    async def _exercise_async_apis() -> None:
+        r1 = await cli.run_async(["fetch", "p", "q"])
+        assert r1 == ["P", "Q"]
+
+        r2 = await cli.run_async(["fetch", "z", "--json"])
+        assert isinstance(r2, AgentResult)
+        assert r2.result == ["Z"]
+
+        r3 = await AsyncFetchCommand.run_async(["solo"])
+        assert r3 == ["SOLO"]
+
+        r4 = await mcp.call_tool_async("fetch", {"urls": ["k"]})
+        assert r4.ok is True
+        assert r4.result == ["K"]
+
+        r5 = await mcp.call_tool_async("unknown_tool", {})
+        assert r5.ok is False
+
+    asyncio.run(_exercise_async_apis())
+    capsys.readouterr()
+
+
+def test_spinner_sync_async_tty_agent_json_and_decorator(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import enum
-    import inspect
+    import time
 
-    from clio.agent import serialize_for_json
+    monkeypatch.setattr(Colors, "ENABLED", False)
+    monkeypatch.delenv("CLIO_AGENT", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+
+    class FakeTTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    # 1. Interactive TTY animation, .update(), .succeed(), and cursor hide/restore
+    tty_buf = FakeTTY()
+    fast_cfg = SpinnerConfig(frames=("-", "\\", "|", "/"), interval=0.005)
+    with Spinner("Loading", config=fast_cfg, stream=tty_buf, agent_mode=False) as sp:
+        time.sleep(0.02)
+        sp.update("Finalizing")
+        time.sleep(0.01)
+        sp.succeed("Completed cleanly")
+
+    tty_out = tty_buf.getvalue()
+    assert "\033[?25l" in tty_out  # Cursor hidden on enter
+    assert "\033[?25h" in tty_out  # Cursor restored on exit
+    assert "✔ Completed cleanly" in tty_out
+
+    # 2. Exception inside interactive TTY spinner still restores cursor and emits error glyph
+    tty_err_buf = FakeTTY()
+    with pytest.raises(ValueError, match="boom"):
+        with Spinner("Working", config=fast_cfg, stream=tty_err_buf, agent_mode=False):
+            raise ValueError("boom")
+    err_tty_out = tty_err_buf.getvalue()
+    assert "\033[?25h" in err_tty_out
+    assert "✖ Working" in err_tty_out
+
+    # 3. Agent / non-TTY mode disables \r and cursor codes even on FakeTTY, and supports .fail()
+    agent_buf = FakeTTY()
+    with Spinner("Checking", stream=agent_buf, agent_mode=True, show_elapsed=False) as sp2:
+        sp2.fail("Check failed")
+    agent_out = agent_buf.getvalue()
+    assert "\033[?25l" not in agent_out
+    assert "\r" not in agent_out
+    assert agent_out == "✖ Check failed\n"
+
+    # 4. @spinner decorator on sync function, async function, and Command.__call__ + --json capture
+    @spinner("Sync step", show_elapsed=False)
+    def compute_double(x: int) -> int:
+        return x * 2
+
+    @spinner("Async step", show_elapsed=False)
+    async def async_triple(x: int) -> int:
+        await asyncio.sleep(0)
+        return x * 3
+
+    non_tty_err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", non_tty_err)
+    assert compute_double(21) == 42
+    assert asyncio.run(async_triple(7)) == 21
+    assert "✔ Sync step" in non_tty_err.getvalue()
+    assert "✔ Async step" in non_tty_err.getvalue()
+
+    class SpinCommand(Command):
+        """Command decorated with @spinner that also uses cli.spinner().
+
+        Args:
+            target: Target artifact name.
+        """
+
+        name = "spin"
+
+        @spinner("Building target", show_elapsed=False)
+        async def __call__(self, target: str) -> str:
+            assert self.cli is not None
+            async with self.cli.spinner("Uploading target", show_elapsed=False) as sub_sp:
+                await asyncio.sleep(0)
+                sub_sp.succeed(f"Uploaded {target}")
+            return target
+
+    # Verify @spinner preserved __wrapped__ so DocstringParser & ScanPlan see `target`!
+    spin_specs = SpinCommand().get_parameter_specs()
+    assert [s.name for s in spin_specs] == ["target"]
+    assert spin_specs[0].docstring == "Target artifact name."
+
+    spin_cli = Cli(prog="spintool", commands=[SpinCommand], enable_agent_flags=True)
+    json_res = spin_cli.run(["spin", "wheel.whl", "--json"])
+    assert isinstance(json_res, AgentResult)
+    assert json_res.ok is True
+    assert json_res.result == "wheel.whl"
+    msg_texts = [m.text for m in json_res.messages]
+    assert "Uploaded wheel.whl" in msg_texts
+    assert "Building target" in msg_texts
+    capsys.readouterr()
+
+
+# 11. Extended Branch Coverage Across Modules --------------------------------------------------------------------------
+def test_extended_coverage_color_docstr_parser_command_agent_and_cli(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from clio.color import _detect_color_support
     from clio.docstr import _parse_bool
 
@@ -1083,10 +1495,10 @@ def test_extended_coverage_color_docstr_command_agent_and_cli(
     with pytest.raises(ValueError, match="Invalid hex"):
         Colors.hex("#12345")
 
-    # 2. _parse_bool & serialize_for_json & ParameterSpec coercion / schema
+    # 2. _parse_bool, serialize_for_json, ParameterSpec coercion & schema
     assert _parse_bool("yes") is True
     assert _parse_bool("off") is False
-    with pytest.raises(argparse.ArgumentTypeError):
+    with pytest.raises(ValueError, match="invalid boolean value"):
         _parse_bool("maybe")
 
     class ColorEnum(enum.Enum):
@@ -1112,15 +1524,8 @@ def test_extended_coverage_color_docstr_command_agent_and_cli(
     assert merged_arg.short_flags == ("-a", "--alpha")
     assert merged_arg.metavar == "A"
 
-    p_empty = ParameterSpec(name="raw", annotation=argparse.Namespace)
-    assert p_empty.type_label == "argparse.Namespace"
     assert ParameterSpec(name="untyped", annotation=inspect.Parameter.empty).type_label == "str"
-    _, kwargs_pos_default = ParameterSpec(
-        name="opt_pos", annotation=bool, default=True, arg_meta=Arg(positional=True)
-    ).to_argparse()
-    assert kwargs_pos_default["nargs"] == "?"
 
-    # Coerce value & schema branches
     p_bool = ParameterSpec(name="flag", annotation=bool, default=False)
     assert p_bool._coerce_env_value("true") is True
     assert p_bool.coerce_value("1") is True
@@ -1138,6 +1543,11 @@ def test_extended_coverage_color_docstr_command_agent_and_cli(
     p_tuple = ParameterSpec(name="tup", annotation=tuple[int, ...])
     assert p_tuple.coerce_value([1, "2"]) == (1, 2)
 
+    p_fixed_tuple = ParameterSpec(name="pair", annotation=tuple[int, str])
+    assert p_fixed_tuple.coerce_value("7,ok") == (7, "ok")
+    with pytest.raises(ValueError, match="Expected 2 values"):
+        p_fixed_tuple.coerce_value(["7"])
+
     p_set = ParameterSpec(name="st", annotation=set[str])
     assert p_set.coerce_value("x,y") == {"x", "y"}
 
@@ -1150,45 +1560,51 @@ def test_extended_coverage_color_docstr_command_agent_and_cli(
     assert ParameterSpec._annotation_to_json_schema(dict[str, int]) == {"type": "object"}
     assert ParameterSpec._annotation_to_json_schema(float) == {"type": "number"}
     assert ParameterSpec._annotation_to_json_schema(ColorEnum) == {"type": "string", "enum": ["red", "blue"]}
-    assert DocstringParser._unwrap_optional(int | None) == (int, True)
+    assert ParameterSpec._annotation_to_json_schema(tuple[int, str])["prefixItems"] == [
+        {"type": "integer"},
+        {"type": "string"},
+    ]
     DocstringParser.clear_cache()
 
-    # 3. Imperative setup_arguments introspection, invoke_with_arguments, and CallPlan branches
+    # 3. Positional-only dataclass & **kwargs CallPlan + invoke_with_arguments
     @dataclass
     class PosCfg:
         host: str = "localhost"
 
-    class ImperativeCmd(Command):
-        """Imperative command."""
+    class ComplexCallCmd(Command):
+        """Exercise positional-only dataclass, positional scalar, and **kwargs CallPlan branches."""
 
         name = "imp"
 
-        def setup_arguments(self) -> None:
-            assert self.parser is not None
-            self.parser.add_argument("target", help="Target name")
-            self.parser.add_argument("-f", "--flag", action="store_true", help="Bool flag")
-            self.parser.add_argument("--items", nargs="+", type=int, default=[1], help="Int items")
-            self.parser.add_argument("--mode", choices=["fast", "slow"], default="fast", help="Mode")
-
         def __call__(
             self,
-            ns: argparse.Namespace,
+            target: str,
             cfg: PosCfg,
             /,
             *,
-            extra_ns: argparse.Namespace,
+            mode: Literal["fast", "slow"] = "fast",
+            items: list[int] = [1],  # noqa: B006
             **kwargs: Any,
         ) -> dict[str, Any]:
             if self.cli is not None:
                 for _ in self.cli.progress([1, 2], "Iterating"):
                     pass
             print("err-line", file=sys.stderr)
-            return {"host": cfg.host, "target": ns.target, "extra": extra_ns.mode, "kw": kwargs}
+            return {"host": cfg.host, "target": target, "mode": mode, "items": items, "kw": kwargs}
 
-    imp_cmd = ImperativeCmd()
+    imp_cmd = ComplexCallCmd()
     specs = imp_cmd.get_parameter_specs()
     assert any(s.name == "target" for s in specs)
-    assert imp_cmd.invoke_with_arguments({"target": "app", "flag": True})["target"] == "app"
+    assert imp_cmd.invoke_with_arguments({"target": "app", "extra_k": 9})["target"] == "app"
+    assert asyncio.run(imp_cmd.invoke_with_arguments_async({"target": "app"}))["mode"] == "fast"
+
+    # Exercise ScanPlan/OptionBinding/ScanResult/ParseError directly
+    assert isinstance(imp_cmd.get_scan_plan().flag_map["--mode"], OptionBinding)
+    scan_res = imp_cmd.get_scan_plan().parse(["app", "--mode", "slow"], prog="imp")
+    assert isinstance(scan_res, ScanResult)
+    assert scan_res.values["mode"] == "slow"
+    pe = ParseError("bad flag", usage="usage: imp", suggestions=("--mode",), command_path="imp")
+    assert pe.exit_code == 2
 
     with pytest.raises(ValueError, match="cannot be null"):
         imp_cmd.invoke_with_arguments({"target": None})
@@ -1197,13 +1613,15 @@ def test_extended_coverage_color_docstr_command_agent_and_cli(
     with pytest.raises(TypeError, match="not executable"):
         ParentBranchCommand().invoke_with_arguments({})
     with pytest.raises(TypeError, match="Expected a BaseCommand"):
-        Cli(prog="bad", commands=[123])  # type: ignore[list-item]
+        Cli(prog="bad", commands=[123])  # type: ignore
     with pytest.raises(TypeError, match="Expected a @dataclass"):
         Command.from_dataclass(int)
     with pytest.raises(TypeError, match="must either define '__call__'"):
         Command.from_dataclass(PosCfg)
+    with pytest.raises(TypeError, match="must either define '__call__'"):
+        Cli(prog="bad", commands=[PosCfg])
 
-    # 4. Custom Cli subclass, --json parser error, --help-md, --schema on subcommand, and MCP error branches
+    # 4. Custom Cli subclass, --json parser error, invalid choice fuzzy match, --help-md, --schema, --skill, and MCP errors
     class CustomCli(Cli):
         """Custom CLI subclass docstring."""
 
@@ -1228,7 +1646,33 @@ def test_extended_coverage_color_docstr_command_agent_and_cli(
     assert err_json["ok"] is False
     assert "--mode" in err_json["error"]["suggestions"]
 
-    # --help-md and subcommand --schema / --skill
+    # Invalid choice fuzzy suggestion
+    with pytest.raises(SystemExit) as exc_info:
+        app.run(["imp", "my-target", "--mode", "fas", "--json"])
+    assert exc_info.value.code == 2
+    choice_err = json.loads(capsys.readouterr().out)
+    assert "fast" in choice_err["error"]["suggestions"]
+
+    # Missing required argument error
+    with pytest.raises(SystemExit) as exc_info:
+        app.run([])
+    assert exc_info.value.code == 2
+    capsys.readouterr()
+
+    # Empty CLI with no commands prints help cleanly and returns None
+    empty_cli = Cli(prog="empty")
+    assert empty_cli.run([]) is None
+    assert "usage: empty" in Colors.strip_ansi(capsys.readouterr().out)
+
+    # --help, --help-md, --schema, --skill on root and subcommand
+    with pytest.raises(SystemExit):
+        app.run(["--help"])
+    assert "usage: custom" in Colors.strip_ansi(capsys.readouterr().out)
+
+    with pytest.raises(SystemExit):
+        app.run(["imp", "--help"])
+    assert "usage: custom imp" in Colors.strip_ansi(capsys.readouterr().out)
+
     with pytest.raises(SystemExit):
         app.run(["--help-md"])
     assert "# `custom`" in capsys.readouterr().out
@@ -1245,7 +1689,7 @@ def test_extended_coverage_color_docstr_command_agent_and_cli(
         app.run(["--skill"])
     assert "name: custom" in capsys.readouterr().out
 
-    # MCP error handling branches (parse error, invalid request, ping, unknown method, invalid params, unknown tool)
+    # MCP error handling branches
     mcp_lines = [
         "",
         "{invalid-json",
@@ -1271,3 +1715,537 @@ def test_extended_coverage_color_docstr_command_agent_and_cli(
     assert mcp_resps[5]["error"]["code"] == -32602
     assert mcp_resps[6]["result"]["isError"] is True
     assert mcp_resps[7]["result"]["isError"] is True
+
+
+def test_scanner_formatter_group_and_async_error_branches(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Colors, "ENABLED", False)
+
+    class StageEnum(enum.Enum):
+        DEV = "dev"
+        PROD = "prod"
+
+    @dataclass
+    class SelfDataclassCmd(Command):
+        """Command class that is itself a @dataclass."""
+
+        name: str = field(default="selfdc", init=False)
+        item: str
+        retries: int = 2
+
+        def __call__(self) -> tuple[str, int]:
+            return (self.item, self.retries)
+
+    classPositionalEdges = None  # marker
+
+    class PositionalEdgesCmd(Command):
+        """Exercise variadic + fixed-tuple positionals, env fallbacks, and long option wrapping.
+
+        Args:
+            sources: Source files list.
+            pair: Fixed coordinate pair.
+            very_long_descriptive_configuration_flag: First paragraph of help.
+
+                Second paragraph that is intentionally long enough to trigger line wrapping inside HelpFormatter.
+        """
+
+        name = "posedges"
+
+        def __call__(
+            self,
+            sources: list[str],
+            pair: tuple[int, str],
+            *,
+            tags: set[str] = set(),  # noqa: B006
+            meta: dict[str, str] = {},  # noqa: B006
+            stages: list[StageEnum] = [],  # noqa: B006
+            flag_bool: Literal[True, False] = False,
+            very_long_descriptive_configuration_flag: Annotated[str, Arg(env="LONG_CFG_ENV")] = "default",
+            req_opt: list[int],
+        ) -> dict[str, Any]:
+            assert classPositionalEdges is None
+            return {
+                "sources": sources,
+                "pair": pair,
+                "tags": tags,
+                "meta": meta,
+                "stages": stages,
+                "flag_bool": flag_bool,
+                "long_cfg": very_long_descriptive_configuration_flag,
+                "req_opt": req_opt,
+            }
+
+    monkeypatch.setenv("LONG_CFG_ENV", "from-env")
+    cli = Cli(
+        prog="edgetool",
+        version="1.0.0",
+        commands=[PositionalEdgesCmd, SelfDataclassCmd, ParentBranchCommand],
+        formatter=HelpFormatter(max_width=65, col_width=24),
+        enable_agent_flags=True,
+    )
+
+    # 1. Variadic positional followed by fixed-tuple positional + Enum list + Literal[bool] + long help wrapping
+    help_str = PositionalEdgesCmd().format_help(
+        prog_prefix="edgetool",
+        formatter=HelpFormatter(max_width=65, col_width=24),
+    )
+    assert "--very-long-descriptive-configuration-flag" in help_str
+    assert "[env: LONG_CFG_ENV]" in " ".join(help_str.split())
+
+    res = cli.run(
+        [
+            "posedges",
+            "f1.txt",
+            "f2.txt",
+            "7",
+            "ok",
+            "--stages",
+            "dev",
+            "prod",
+            "--flag-bool",
+            "true",
+            "--req-opt",
+            "10",
+            "20",
+        ]
+    )
+    assert res["sources"] == ["f1.txt", "f2.txt"]
+    assert res["pair"] == (7, "ok")
+    assert res["stages"] == [StageEnum.DEV, StageEnum.PROD]
+    assert res["flag_bool"] is True
+    assert res["long_cfg"] == "from-env"
+    assert res["req_opt"] == [10, 20]
+
+    # 2. Self-@dataclass Command execution + --dry-run resolve_arguments
+    assert cli.run(["selfdc", "alpha", "--retries", "5"]) == ("alpha", 5)
+    dry_selfdc = cli.run(["--dry-run", "selfdc", "beta"])
+    assert isinstance(dry_selfdc, AgentResult)
+    assert dry_selfdc.arguments == {"item": "beta", "retries": 2}
+    capsys.readouterr()
+
+    # 3. Scanner ParseError edge cases (missing scalar arg, invalid type, invalid bool, missing variadic opt, bad tuple pos)
+    for bad_args in (
+        ["--unknown-root-flag"],
+        ["--", "unknown_cmd"],
+        ["branch", "--unknown-group-flag"],
+        ["branch", "leafcomman"],
+        ["selfdc", "alpha", "--retries"],
+        ["selfdc", "alpha", "--retries", "--other"],
+        ["selfdc", "alpha", "--retries", "not-an-int"],
+        ["posedges", "only_one_token", "--req-opt", "1"],
+        ["posedges", "a", "7", "ok", "--req-opt"],
+        ["posedges", "a", "7", "ok", "--req-opt="],
+        ["posedges", "a", "7", "ok", "--req-opt", "1", "--stages", "invalid_stage"],
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.run(bad_args)
+        assert exc_info.value.code == 2
+        capsys.readouterr()
+
+    # 4. CommandGroup eager introspection (--help, --schema, --help-md, --skill) and resolve_arguments fallback
+    assert ParentBranchCommand().resolve_arguments({"x": 1}) == {"x": 1}
+    for group_eager in (
+        ["branch", "--help"],
+        ["branch", "--schema"],
+        ["branch", "--help-md"],
+        ["branch", "--skill"],
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.run(group_eager)
+        assert exc_info.value.code == 0
+        capsys.readouterr()
+
+    # 5. Single-command eager actions (--help, --version, --schema, --help-md, --skill)
+    single_cli = Cli(prog="solo", version="0.9.0", command=SelfDataclassCmd, enable_agent_flags=True)
+    for solo_eager in (["--help"], ["--version"], ["--schema"], ["--help-md"], ["--skill"]):
+        with pytest.raises(SystemExit) as exc_info:
+            single_cli.run(solo_eager)
+        assert exc_info.value.code == 0
+        capsys.readouterr()
+
+    # 6. McpServer catching CliError in sync call_tool and async call_tool_async, plus run_async sync & error paths
+    class ErrCmd(Command):
+        """Raise CliError on demand."""
+
+        name = "errcmd"
+
+        async def __call__(self, *, code: int = 5) -> str:
+            raise CliError("async boom", exit_code=code)
+
+    err_cli = Cli(prog="errtool", commands=[ErrCmd, SelfDataclassCmd], enable_agent_flags=True)
+    err_mcp = McpServer(err_cli)
+    sync_err_tool = err_mcp.call_tool("errcmd", {"code": 6})
+    assert sync_err_tool.ok is False
+    assert sync_err_tool.error is not None
+    assert sync_err_tool.error.exit_code == 6
+
+    async def _async_checks() -> None:
+        # Sync command via run_async
+        assert await err_cli.run_async(["selfdc", "sync-in-async"]) == ("sync-in-async", 2)
+
+        # Dry-run via run_async
+        dr = await err_cli.run_async(["selfdc", "dry", "--dry-run"])
+        assert isinstance(dr, AgentResult) and dr.dry_run is True
+
+        # Async CliError in --json mode via run_async
+        with pytest.raises(SystemExit) as e1:
+            await err_cli.run_async(["errcmd", "--code", "11", "--json"])
+        assert e1.value.code == 11
+
+        # Async CliError in plain mode via run_async
+        with pytest.raises(SystemExit) as e2:
+            await err_cli.run_async(["errcmd", "--code", "12"])
+        assert e2.value.code == 12
+
+        # Async MCP call_tool_async error trapping
+        async_err_tool = await err_mcp.call_tool_async("errcmd", {"code": 7})
+        assert async_err_tool.ok is False
+        assert async_err_tool.error is not None and async_err_tool.error.exit_code == 7
+
+    asyncio.run(_async_checks())
+    capsys.readouterr()
+
+    # 7. DocstringParser.resolve_annotations direct checks
+    hints = DocstringParser.resolve_annotations(SelfDataclassCmd)
+    assert hints["item"] is str
+    err_dict = AgentErrorSpec(message="bad", exit_code=2, usage="usage: x", suggestions=("--y",)).to_dict()
+    assert err_dict["usage"] == "usage: x"
+    assert err_dict["suggestions"] == ["--y"]
+
+
+def test_plain_functions_first_class_cli_and_lazy_annotations(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Colors, "ENABLED", False)
+
+    @dataclass(frozen=True, slots=True)
+    class StepParams:
+        """Hyperparameters for a training step.
+
+        Attributes:
+            lr: Learning rate.
+            batch_size: Mini-batch size.
+        """
+
+        lr: float = 0.01
+        batch_size: int = 32
+
+    def run_step(cfg: StepParams, /, *, epochs: int = 3, tag: str = "exp") -> dict[str, Any]:
+        """Run synchronous optimization step.
+
+        Args:
+            epochs: Number of passes.
+            tag: Run tag label.
+        """
+        return {"lr": cfg.lr, "batch_size": cfg.batch_size, "epochs": epochs, "tag": tag}
+
+    async def async_score(values: list[float], *, scale: float = 2.0) -> float:
+        """Compute scaled sum asynchronously."""
+        await asyncio.sleep(0)
+        return sum(values) * scale
+
+    broken_evals = 0
+
+    def _raise_if_evaluated() -> type[int]:
+        nonlocal broken_evals
+        broken_evals += 1
+        raise RuntimeError("sibling function __annotate__ must stay lazy!")
+
+    def broken_sibling(x: _raise_if_evaluated()) -> int:  # type: ignore
+        """Sibling function with failing PEP 649 annotation."""
+        return x
+
+    cli = Cli(
+        prog="fnapp",
+        commands=[run_step, async_score, broken_sibling],
+        enable_agent_flags=True,
+    )
+
+    # Registration and root `--help` must NOT evaluate sibling function annotations
+    assert broken_evals == 0
+    root_help = cli.format_help()
+    assert "run_step" in root_help
+    assert "Run synchronous optimization step." in root_help
+    assert broken_evals == 0
+
+    # Both `run_step` and automatic kebab-case alias `run-step` route in O(1) without touching broken_sibling
+    res1 = cli.run(["run_step", "--lr", "0.05", "--epochs", "5"])
+    assert res1 == {"lr": 0.05, "batch_size": 32, "epochs": 5, "tag": "exp"}
+    res2 = cli.run(["run-step", "--batch-size", "64", "--tag", "v2"])
+    assert res2 == {"lr": 0.01, "batch_size": 64, "epochs": 3, "tag": "v2"}
+    assert broken_evals == 0
+
+    # `--dry-run` hydrates nested @dataclass bindings on plain functions
+    dry = cli.run(["--dry-run", "run-step", "--lr", "0.1"])
+    assert isinstance(dry, AgentResult)
+    assert dry.dry_run is True
+    assert dry.arguments["cfg"] == StepParams(lr=0.1, batch_size=32)
+    capsys.readouterr()
+
+    # Async plain function works via sync `cli.run()` and `cli.run_async()`
+    assert cli.run(["async-score", "1.5", "2.5", "--scale", "3.0"]) == 12.0
+    assert asyncio.run(cli.run_async(["async_score", "2.0", "4.0"])) == 12.0
+
+    # Single-command `Cli(command=plain_fn)` and `Command.from_function()`
+    fn_cmd = Command.from_function(run_step)
+    assert isinstance(fn_cmd, FunctionCommand)
+    assert fn_cmd(StepParams(lr=0.2, batch_size=8), epochs=1, tag="direct")["lr"] == 0.2
+    assert fn_cmd.invoke_with_arguments({"lr": 0.3, "batch_size": 16})["batch_size"] == 16
+
+    solo = Cli(command=async_score, enable_agent_flags=True)
+    json_out = solo.run(["--json", "10", "5", "--scale", "0.5"])
+    assert isinstance(json_out, AgentResult) and json_out.result == 7.5
+    capsys.readouterr()
+
+    with pytest.raises(TypeError):
+        Command.from_function(StepParams)
+
+
+def test_zero_edit_target_runner_and_dunder_main(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Colors, "ENABLED", False)
+
+    # 1. TargetSpec parsing (POSIX, Windows drive letters, dotted modules, validation errors)
+    s_file = TargetSpec.parse("tools/ analyze.py : run_job ")
+    assert s_file == TargetSpec(module_or_path="tools/ analyze.py", symbol="run_job", is_file=True)
+    s_win = TargetSpec.parse(r"C:\repo\script.py:my_fn")
+    assert s_win == TargetSpec(module_or_path=r"C:\repo\script.py", symbol="my_fn", is_file=True)
+    s_mod = TargetSpec.parse("pkg.submod:MyCls.method")
+    assert s_mod == TargetSpec(module_or_path="pkg.submod", symbol="MyCls.method", is_file=False)
+    s_whole = TargetSpec.parse("pkg.submod")
+    assert s_whole == TargetSpec(module_or_path="pkg.submod", symbol=None, is_file=False)
+
+    for invalid_spec in ("", "   ", ":only_sym", "script.py:"):
+        with pytest.raises(CliError):
+            TargetSpec.parse(invalid_spec)
+
+    # 2. Untouched standalone external Python script (never imports `clio`, has `__main__` guard)
+    ext_script = tmp_path / "ext_tools.py"
+    ext_script.write_text(
+        '''"""External repository data utilities."""
+
+import asyncio
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class ModelHyperParams:
+    """Configuration schema without __call__.
+
+    Attributes:
+        lr: Learning rate.
+        layers: Transformer block count.
+    """
+
+    lr: float = 1e-3
+    layers: int = 12
+
+
+@dataclass
+class ExportTask:
+    """Callable dataclass job."""
+
+    dest: Path
+    overwrite: bool = False
+
+    def __call__(self) -> dict[str, Any]:
+        return {"dest": str(self.dest), "overwrite": self.overwrite}
+
+
+class ZeroArgCallable:
+    """Plain zero-arg callable class."""
+
+    def __call__(self, factor: int = 2) -> int:
+        return factor * 21
+
+
+class NeedsInitCallable:
+    def __init__(self, secret: str) -> None:
+        self.secret = secret
+
+    def __call__(self) -> str:
+        return self.secret
+
+
+class PlainNotCallable:
+    pass
+
+
+CONSTANT_VALUE = 42
+
+
+def summarize_records(
+    input_path: Path,
+    *,
+    limit: int = 5,
+    shout: bool = False,
+) -> dict[str, Any]:
+    """Summarize records from an input path.
+
+    Args:
+        input_path: Path to source file.
+        limit: Max rows to inspect.
+        shout: Uppercase summary label.
+    """
+    label = input_path.name.upper() if shout else input_path.name
+    return {"label": label, "limit": limit}
+
+
+async def async_pipeline(items: list[str], *, multiplier: int = 2) -> list[str]:
+    """Run an async batch transformation."""
+    await asyncio.sleep(0)
+    return [item * multiplier for item in items]
+
+
+def failing_task(reason: str = "bad state") -> None:
+    """Raise a standard ValueError without importing clio."""
+    raise ValueError(reason)
+
+
+if __name__ == "__main__":
+    raise RuntimeError("__main__ block must NOT execute when loaded by clio.runner!")
+''',
+        encoding="utf-8",
+    )
+
+    # 2a. Single-function `--dry-run --json` and live `--json` via `runner_main`
+    dry_res = runner_main([f"{ext_script}:summarize_records", "--dry-run", "--json", "data.csv", "--limit", "10"])
+    assert isinstance(dry_res, AgentResult)
+    assert dry_res.dry_run is True
+    assert dry_res.arguments == {"input_path": Path("data.csv"), "limit": 10, "shout": False}
+    dry_stdout = json.loads(capsys.readouterr().out)
+    assert dry_stdout["ok"] is True and dry_stdout["command"] == "summarize_records"
+
+    live_res = runner_main([f"{ext_script}:summarize_records", "--json", "notes.txt", "--shout"])
+    assert isinstance(live_res, AgentResult)
+    assert live_res.result == {"label": "NOTES.TXT", "limit": 5}
+    capsys.readouterr()
+
+    # 2b. Async target via `run_target` and `run_target_async`
+    assert run_target(f"{ext_script}:async_pipeline", ["ab", "cd", "--multiplier", "3"]) == ["ababab", "cdcdcd"]
+    assert asyncio.run(run_target_async(f"{ext_script}:async_pipeline", ["x", "--multiplier", "4"])) == ["xxxx"]
+
+    # 2c. Non-callable `@dataclass` target hydrated directly via `:ModelHyperParams`
+    hp_res = runner_main([f"{ext_script}:ModelHyperParams", "--lr", "0.02", "--json"])
+    assert isinstance(hp_res, AgentResult)
+    assert json.loads(capsys.readouterr().out)["result"] == {"lr": 0.02, "layers": 12}
+
+    # 2d. Zero-arg callable class works; non-callable / required-init / constant targets raise clean CliError
+    assert run_target(f"{ext_script}:ZeroArgCallable", ["--factor", "3"]) == 63
+    for bad_sym in ("NeedsInitCallable", "PlainNotCallable", "CONSTANT_VALUE"):
+        with pytest.raises(CliError):
+            build_target_cli(f"{ext_script}:{bad_sym}")
+
+    # 2e. Domain exception inside untouched function is trapped cleanly in `--json` envelope
+    with pytest.raises(SystemExit) as dom_exc:
+        runner_main([f"{ext_script}:failing_task", "--reason", "disk full", "--json"])
+    assert dom_exc.value.code == 1
+    dom_json = json.loads(capsys.readouterr().out)
+    assert dom_json["ok"] is False
+    assert dom_json["error"]["message"] == "disk full"
+
+    # 2f. Whole-file discovery (`ext_script` without `:symbol`): exposes public functions & callable @dataclass,
+    #     skips `Path` import and non-callable `ModelHyperParams` DTO, and serves multi-tool `--mcp`!
+    mod_cli = build_target_cli(str(ext_script))
+    discovered_names = [cmd.name for cmd in mod_cli.commands]
+    assert discovered_names == ["exporttask", "summarize_records", "async_pipeline", "failing_task"]
+
+    mcp_requests = [
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "async_pipeline", "arguments": {"items": ["hi"], "multiplier": 2}},
+            }
+        ),
+    ]
+    mcp_in = io.StringIO("\n".join(mcp_requests) + "\n")
+    mcp_out = io.StringIO()
+    mod_cli.serve_mcp(stdin=mcp_in, stdout=mcp_out)
+    mcp_lines = [json.loads(line) for line in mcp_out.getvalue().splitlines() if line.strip()]
+    tool_names = [t["name"] for t in mcp_lines[0]["result"]["tools"]]
+    assert "summarize_records" in tool_names and "async_pipeline" in tool_names
+    assert json.loads(mcp_lines[1]["result"]["content"][0]["text"])["result"] == ["hihi"]
+
+    # 3. Package hierarchy with `__init__.py` and relative imports + directory / dotted-module targets
+    pkg_dir = tmp_path / "sample_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text(
+        '"""Sample package root."""\n\ndef root_ping(name: str = "world") -> str:\n    return f"hello {name}"\n',
+        encoding="utf-8",
+    )
+    (pkg_dir / "constants.py").write_text("OFFSET = 100\n", encoding="utf-8")
+    (pkg_dir / "ops.py").write_text(
+        "from .constants import OFFSET\n\ndef add_offset(val: int) -> int:\n    return val + OFFSET\n",
+        encoding="utf-8",
+    )
+    assert run_target(f"{pkg_dir / 'ops.py'}:add_offset", ["23"]) == 123
+    assert run_target(str(pkg_dir), ["root-ping", "--name", "clio"]) == "hello clio"
+    monkeypatch.chdir(tmp_path)
+    assert run_target("sample_pkg.ops:add_offset", ["7"]) == 107
+
+    # 4. Existing `Cli` instance in a module gets `enable_agent_flags=True` automatically
+    app_file = tmp_path / "existing_cli_mod.py"
+    app_file.write_text(
+        "from clio import Cli\n\ndef greet(who: str = 'agent') -> str:\n    return f'hi {who}'\n\n"
+        "app = Cli(prog='prebuilt', commands=[greet], enable_agent_flags=False)\n",
+        encoding="utf-8",
+    )
+    upgraded = runner_main([str(app_file), "greet", "--who", "tom", "--json"])
+    assert isinstance(upgraded, AgentResult) and upgraded.result == "hi tom"
+    capsys.readouterr()
+
+    # 5. Runner CLI top-level flags (`clio`, `--help`, `--version`, unknown flag, fuzzy symbol typo, `python -m clio`)
+    assert runner_main([]) is None
+    assert "usage: clio" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as h_exc:
+        runner_main(["--help"])
+    assert h_exc.value.code == 0
+    assert "TARGET" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as v_exc:
+        runner_main(["--version"])
+    assert v_exc.value.code == 0
+    assert capsys.readouterr().out.startswith("clio ")
+
+    # Unknown pre-target flag in JSON mode
+    with pytest.raises(SystemExit) as bad_opt_exc:
+        runner_main(["--versio", "--json"])
+    assert bad_opt_exc.value.code == 2
+    bad_opt_json = json.loads(capsys.readouterr().out)
+    assert "--version" in bad_opt_json["error"]["suggestions"]
+
+    # Fuzzy symbol suggestion on `:typo` in JSON mode, agent mode, and human mode
+    with pytest.raises(SystemExit) as sym_exc:
+        runner_main([f"{ext_script}:summarize_record", "--json"])
+    assert sym_exc.value.code == 2
+    sym_json = json.loads(capsys.readouterr().out)
+    assert "summarize_records" in sym_json["error"]["suggestions"]
+
+    monkeypatch.setenv("CLIO_AGENT", "1")
+    with pytest.raises(SystemExit):
+        runner_main([f"{tmp_path / 'missing.py'}:fn"])
+    assert "clio: error:" in capsys.readouterr().err
+
+    monkeypatch.delenv("CLIO_AGENT", raising=False)
+    with pytest.raises(SystemExit):
+        runner_main([f"{ext_script}:summarize_record"])
+    assert "Did you mean:" in capsys.readouterr().err
+
+    # Execute `clio/__main__.py` directly via `runpy.run_module("clio", run_name="__main__")`
+    monkeypatch.setattr(sys, "argv", ["clio", f"{ext_script}:summarize_records", "report.md", "--limit", "2", "--json"])
+    runpy.run_module("clio", run_name="__main__")
+    dunder_out = json.loads(capsys.readouterr().out)
+    assert dunder_out["ok"] is True
+    assert dunder_out["result"] == {"label": "report.md", "limit": 2}

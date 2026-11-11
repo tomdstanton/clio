@@ -5,13 +5,12 @@ import time
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
-from typing import Annotated, Any, ClassVar
+from typing import Annotated, ClassVar
 
 import pytest
 
 from clio import (
     Arg,
-    BaseCommand,
     CallPlan,
     Cli,
     CliConfig,
@@ -23,9 +22,15 @@ from clio import (
     DataclassCommand,
     DocstringParser,
     DocstringSpec,
+    HelpFormatter,
+    OptionBinding,
     PackageMeta,
     ParameterSpec,
+    ScanPlan,
+    ScanResult,
+    SpinnerConfig,
     Style,
+    TargetSpec,
 )
 
 DOCS_BENCHMARKS_PATH = Path(__file__).resolve().parents[1] / "docs" / "benchmarks.md"
@@ -168,7 +173,7 @@ class BenchClusterGroup(CommandGroup):
     """Manage cluster operations."""
 
     name = "cluster"
-    subcommands: list[BaseCommand | type[Any]] = [BenchStatusCommand]
+    subcommands = [BenchStatusCommand]
 
 
 def _measure_case(case: BenchmarkCase, fn: Callable[[], object], *, warmup: int = 25) -> BenchmarkMetric:
@@ -218,6 +223,10 @@ def collect_architecture_footprints() -> tuple[ArchitectureFootprint, ...]:
         parameters={"workers": "Number of parallel rollout workers."},
         specs=(param_spec,),
     )
+    opt_binding = OptionBinding(spec=param_spec, implicit_bool=None)
+    scan_plan = ScanPlan.compile((param_spec,))
+    scan_result = ScanResult(values={"workers": 8})
+    help_fmt = HelpFormatter()
     dc_binding = DataclassBinding(
         param_name="config",
         dc_cls=BenchDeployConfig,
@@ -226,9 +235,9 @@ def collect_architecture_footprints() -> tuple[ArchitectureFootprint, ...]:
     )
     call_plan = CallPlan(
         has_custom_call=True,
-        is_namespace_call=False,
+        is_async=False,
         pos_params=(),
-        kw_params=(("env", False), ("workers", False), ("force", False)),
+        kw_params=("env", "workers", "force"),
         dc_bindings=(dc_binding,),
         self_dc_fields=(),
         has_var_kw=False,
@@ -242,6 +251,7 @@ def collect_architecture_footprints() -> tuple[ArchitectureFootprint, ...]:
         help_text="Deploy application services.",
         docstring_spec=doc_spec,
         call_plan=call_plan,
+        scan_plan=scan_plan,
     )
     pkg_meta = PackageMeta(
         name="clio",
@@ -259,19 +269,28 @@ def collect_architecture_footprints() -> tuple[ArchitectureFootprint, ...]:
         description="Lightweight CLI framework.",
         epilog=None,
         version="0.1.0",
+        formatter=help_fmt,
         package_meta=pkg_meta,
     )
+    spinner_cfg = SpinnerConfig()
+    target_spec = TargetSpec.parse("path/to/script.py:my_fn")
     style = Style(fg=Colors.BRIGHT_CYAN, bold=True)
 
     entries: list[tuple[object, str, str]] = [
         (arg_meta, "clio.docstr", "Declarative Annotated[T, Arg(...)] CLI flag & env metadata"),
-        (param_spec, "clio.docstr", "Introspected parameter type, default, Arg metadata, and help"),
+        (param_spec, "clio.docstr", "Introspected parameter type, default, Arg metadata, and coercion"),
         (doc_spec, "clio.docstr", "Parsed docstring summary, body, and parameter map"),
+        (opt_binding, "clio.parser", "Flag-to-ParameterSpec binding entry in ScanPlan"),
+        (scan_plan, "clio.parser", "Pre-compiled O(1) strict CLI token scanner"),
+        (scan_result, "clio.parser", "Immutable scanned parameter dictionary and mode flags"),
+        (help_fmt, "clio.parser", "Zero-dependency ANSI usage and multi-section help renderer"),
         (dc_binding, "clio.command", "Pre-computed @dataclass field binding for CLI hydration"),
-        (call_plan, "clio.command", "Pre-compiled dispatch plan replacing runtime inspect.signature()"),
-        (cmd_spec, "clio.command", "Cached command specification (name, help, docstring, CallPlan)"),
+        (call_plan, "clio.command", "Pre-compiled sync/async dispatch plan replacing inspect.signature()"),
+        (cmd_spec, "clio.command", "Cached command specification (name, help, ScanPlan, CallPlan)"),
         (pkg_meta, "clio.cli", "Extracted PEP 621 package metadata from importlib.metadata"),
         (cli_cfg, "clio.cli", "Immutable root CLI configuration and behavior flags"),
+        (spinner_cfg, "clio.spinner", "Visual glyph frames, timing interval, and Style for Spinner"),
+        (target_spec, "clio.runner", "Parsed zero-edit file/module target specifier (`script.py:fn`)"),
         (style, "clio.color", "Composable ANSI SGR style sequence with pre-compiled prefix"),
     ]
 
@@ -322,12 +341,12 @@ def benchmark_report() -> BenchmarkReport:
 
         return DynamicCommand
 
-    # 2. Cold CommandSpec.compile + DocstringParser.inspect via annotationlib
+    # 2. Cold CommandSpec.compile + DocstringParser.inspect + ScanPlan.compile via annotationlib
     case_cold_spec = BenchmarkCase(
         case_id="spec_compile_cold",
         name="Cold CommandSpec Compilation",
         category="Compile",
-        description="Single-pass cold introspection (`annotationlib` + `DocstringParser.inspect` + `CallPlan.compile`).",
+        description="Single-pass cold introspection (`annotationlib` + `ScanPlan.compile` + `CallPlan.compile`).",
         iterations=250,
         max_median_us=2000.0,
     )
@@ -337,7 +356,6 @@ def benchmark_report() -> BenchmarkReport:
         BenchDeployCommand._spec = None
         return BenchDeployCommand.get_spec()
 
-    # Ensure warm state after cold benchmark
     BenchDeployCommand.get_spec()
 
     # 3. Warm Command() instantiation
@@ -366,14 +384,14 @@ def benchmark_report() -> BenchmarkReport:
     def bench_dc_compile() -> DataclassCommand:
         return Command.from_dataclass(BenchDeployConfig, name="config")
 
-    # 5. Cli + subparser tree construction
+    # 5. Cli + lazy subcommand tree registration
     case_cli_build = BenchmarkCase(
         case_id="cli_build_tree",
-        name="CLI & Subparser Tree Construction",
+        name="Lazy CLI Route Indexing",
         category="Build",
-        description="Construct `Cli` and wire `Command`, `CommandGroup`, and `@dataclass` subparsers.",
-        iterations=250,
-        max_median_us=5000.0,
+        description="Construct `Cli` and lazily index `Command`, `CommandGroup`, and `@dataclass` routes without evaluating `__annotate__`.",
+        iterations=500,
+        max_median_us=250.0,
     )
 
     def bench_cli_build() -> Cli:
@@ -383,17 +401,16 @@ def benchmark_report() -> BenchmarkReport:
         cli.add_command(BenchDeployConfig)
         return cli
 
-    # Pre-built CLI for runtime dispatch benchmarks
     runtime_cli = bench_cli_build()
 
     # 6. End-to-end Cli.run() command dispatch
     case_cli_dispatch = BenchmarkCase(
         case_id="cli_run_dispatch",
-        name="CLI Parse & CallPlan Dispatch",
+        name="ScanPlan Parse & CallPlan Dispatch",
         category="Runtime",
-        description="End-to-end `cli.run([...])` argument parsing and fast-path `CallPlan.invoke()` dispatch.",
-        iterations=600,
-        max_median_us=500.0,
+        description="End-to-end `cli.run([...])` native `ScanPlan.parse()` and fast-path `CallPlan.invoke()` dispatch.",
+        iterations=1000,
+        max_median_us=250.0,
     )
 
     def bench_cli_dispatch() -> None:
@@ -405,8 +422,8 @@ def benchmark_report() -> BenchmarkReport:
         name="Frozen @dataclass CLI Hydration",
         category="Runtime",
         description="End-to-end `cli.run([...])` hydrating a `@dataclass(frozen=True, slots=True)` payload.",
-        iterations=600,
-        max_median_us=500.0,
+        iterations=1000,
+        max_median_us=250.0,
     )
 
     def bench_cli_dataclass() -> None:
@@ -469,23 +486,24 @@ def render_benchmark_markdown(report: BenchmarkReport) -> str:
         "# Performance & Architecture Benchmarks",
         "",
         "`clio` is engineered around a strict **Stateless Specification / Stateful Execution** split",
-        "built natively on Python 3.14's `annotationlib` (PEP 649 / PEP 749).",
-        "Expensive introspection (`annotationlib.get_annotations`, `inspect.signature`, docstring parsing,",
-        "`Annotated[T, Arg(...)]` extraction, and `@dataclass` field binding) happens **once in a single pass**",
-        "and is cached in immutable `@dataclass(frozen=True, slots=True)` specifications.",
+        "built natively on Python 3.14's `annotationlib` (PEP 649 / PEP 749) and a custom zero-`argparse`",
+        "token scanner (`ScanPlan`). Expensive introspection (`annotationlib`, `inspect.signature`,",
+        "PEP 695 `TypeAliasType` unwrapping, docstring parsing, `Annotated[T, Arg(...)]` extraction,",
+        "and `@dataclass` field binding) happens **lazily on the matched command path only** and is",
+        "cached in immutable `@dataclass(frozen=True, slots=True)` specifications.",
         "",
         '!!! info "Benchmark Environment"',
         f"    - **Runtime**: `{report.python_version}`",
         f"    - **Platform**: `{report.platform_label}`",
-        "    - **Suite**: `tests/test_benchmarks.py` (enforced in `pytest` and `.pre-commit-config.yaml`)",
+        "    - **Suite**: `tests/test_benchmarks.py` (enforced in `pytest` and `prek.toml`)",
         "",
         "## Lifecycle Architecture",
         "",
         "```mermaid",
         "flowchart LR",
-        '    A["Class Definition\\n(PEP 649 __annotate__)"] --> B["Single-Pass Spec Compile\\n(annotationlib + CallPlan)"]',
-        '    B --> C["Parser Wiring\\n(Cli.add_command)"]',
-        '    C --> D["O(1) Fast-Path Dispatch\\n(CallPlan.invoke)"]',
+        '    A["Lazy Route Indexing\\n(Cli.add_command)"] --> B["O(depth) Subcommand Match\\n(Zero Sibling __annotate__)"]',
+        '    B --> C["Single-Pass Spec Compile\\n(annotationlib + ScanPlan + CallPlan)"]',
+        '    C --> D["O(1) Token Scan & Dispatch\\n(ScanPlan.parse + CallPlan.invoke)"]',
         "```",
         "",
         "## Micro-Benchmark Results",
@@ -544,16 +562,16 @@ def render_benchmark_markdown(report: BenchmarkReport) -> str:
     lines.extend(
         [
             "",
-            "## Why `clio` Stays Fast vs. `typer` & `cyclopts`",
+            "## Why `clio` Stays Fast vs. `clypi`, `cyclopts` & `typer`",
             "",
-            "| Dimension | `clio` (Python 3.14+) | `cyclopts` | `typer` |",
-            "| :--- | :--- | :--- | :--- |",
-            "| **Runtime Dependencies** | **0** (`stdlib` + `annotationlib` only) | `attrs`, `rich`, `docstring-parser` | `click`, `rich`, `shellingham`, `typing-extensions` |",
-            "| **Annotation Engine** | **Native PEP 649 `__annotate__` + `Format.FORWARDREF`** (single-pass bytecode, no string `eval()`) | `typing.get_type_hints` + `Annotated` inspection | `typing.get_type_hints` + Click `OptionInfo` |",
-            "| **Subclass Definition** | **Lazy (`~5 µs`)** — defers introspection until first build/spec access | Function/decorator registration | Decorator registration + Click parameter synthesis |",
-            "| **Dispatch Overhead** | **Pre-compiled `CallPlan` (`~14 µs`)** — zero runtime `inspect.signature()` | Runtime token coercion & binding | Click context stack + callback wrapper frames |",
-            "| **Help & Error Rendering** | Direct ANSI SGR (`ColorHelpFormatter`), lazy `difflib` on error only | `rich` console layout & table rendering | `rich` traceback & box rendering |",
-            "| **Docs Generation** | Built-in `Cli.to_markdown()` (`~150 µs`, zero deps) | Sphinx / MkDocs plugin | `typer-cli` external package |",
+            "| Dimension | `clio` (Python 3.14+) | `clypi` | `cyclopts` | `typer` |",
+            "| :--- | :--- | :--- | :--- | :--- |",
+            "| **Runtime Dependencies** | **0** (`stdlib` + `annotationlib` only) | `typing-extensions` | `attrs`, `rich`, `docstring-parser` | `click`, `rich`, `shellingham`, `typing-extensions` |",
+            "| **Annotation Engine** | **Native PEP 649 `__annotate__` + `Format.FORWARDREF` + PEP 695 `type`** (lazy on matched route only) | Pydantic-style class field evaluation across tree | `typing.get_type_hints` + `Annotated` inspection | `typing.get_type_hints` + Click `OptionInfo` |",
+            "| **Async & Spinners** | **Pay-only-when-used `async` + thread-backed `Spinner`** (`CLIO_AGENT=1` / `--json` aware) | Always-async `asyncio.run()` + `asyncio` spinner | Sync-first (`rich` spinners external) | Sync-only unless manually wrapped |",
+            "| **Dispatch Overhead** | **Native `ScanPlan` + `CallPlan`** — zero `argparse` / `Namespace` / runtime `inspect` | Class hydration + coroutine loop startup | Runtime token coercion & binding | Click context stack + callback wrapper frames |",
+            "| **Help & Error Rendering** | Direct ANSI SGR (`HelpFormatter`), lazy `difflib` on error only | Custom ANSI formatter | `rich` console layout & table rendering | `rich` traceback & box rendering |",
+            "| **Docs & Agent Native** | Zero-edit `python -m clio script.py[:fn]`, `to_markdown()`, `to_json_schema()`, `SKILL.md`, stdio `McpServer` | Docs only | Sphinx / MkDocs plugin | `typer-cli` external package |",
             "",
             "## Running & Updating Benchmarks",
             "",
@@ -575,7 +593,7 @@ def render_benchmark_markdown(report: BenchmarkReport) -> str:
 
 def test_all_specs_are_frozen_and_slotted(benchmark_report: BenchmarkReport) -> None:
     """Verify every core clio specification dataclass is both frozen and slotted."""
-    assert len(benchmark_report.footprints) == 9
+    assert len(benchmark_report.footprints) == 15
     for footprint in benchmark_report.footprints:
         assert footprint.is_frozen, f"{footprint.struct_name} must be frozen=True"
         assert footprint.has_slots, f"{footprint.struct_name} must be slots=True (no __dict__)"

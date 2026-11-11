@@ -7,7 +7,7 @@ from clio.agent import (
     serialize_for_json,
 )
 from clio.cli import Cli, CliConfig, PackageMeta
-from clio.color import Colors, Style
+from clio.color import BoxStyle, Colors, Style
 from clio.command import (
     BaseCommand,
     CallPlan,
@@ -19,6 +19,7 @@ from clio.command import (
     FunctionCommand,
 )
 from clio.docstr import Arg, DocstringParser, DocstringSpec, ParameterSpec
+from clio.markdown import MarkdownWriter, TableAlign
 from clio.parser import CliError, HelpFormatter, OptionBinding, ParseError, ScanPlan, ScanResult
 from clio.runner import (
     TargetSpec,
@@ -36,6 +37,7 @@ __all__ = [
     "AgentResult",
     "Arg",
     "BaseCommand",
+    "BoxStyle",
     "CallPlan",
     "Cli",
     "CliConfig",
@@ -50,6 +52,7 @@ __all__ = [
     "DocstringSpec",
     "FunctionCommand",
     "HelpFormatter",
+    "MarkdownWriter",
     "McpServer",
     "OptionBinding",
     "PackageMeta",
@@ -60,6 +63,7 @@ __all__ = [
     "Spinner",
     "SpinnerConfig",
     "Style",
+    "TableAlign",
     "TargetSpec",
     "ToolSpec",
     "build_target_cli",

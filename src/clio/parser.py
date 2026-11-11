@@ -1,12 +1,12 @@
 import enum
 import os
-import textwrap
+import shutil
 import types
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Self
 
-from clio.color import Colors
+from clio.color import BoxStyle, Colors, Style
 from clio.docstr import ParameterSpec, _parse_bool
 
 type EagerAction = Literal["help", "version", "schema", "help_md", "skill", "mcp"]
@@ -612,16 +612,29 @@ class ScanPlan:
         )
 
 
+_PANEL_BORDER_STYLE = Style(fg=Colors.CYAN, dim=True)
+_PANEL_TITLE_STYLE = Style(fg=Colors.CYAN, bold=True)
+_ERROR_BORDER_STYLE = Style(fg=Colors.RED, bold=True)
+_ERROR_TITLE_STYLE = Style(fg=Colors.RED, bold=True)
+
+
 @dataclass(frozen=True, slots=True)
 class HelpFormatter:
-    r"""Immutable, zero-dependency ANSI help and usage renderer for `clio` commands.
+    r"""Immutable, zero-dependency ANSI help, usage, and error panel renderer for `clio` commands.
+
+    Renders structured multi-column panels (`╭─ Options ───╮`) by default for interactive
+    human terminals and automatically degrades to compact unboxed sections when `CLIO_AGENT=1`
+    (`agent_mode=True`) or `TERM=dumb`.
 
     Attributes:
-        max_width (int): Maximum line wrap width in columns.
-        col_width (int): Width reserved for the left-hand argument/flag column.
-        indent (int): Leading space indentation for item rows.
+        max_width (int): Maximum panel / line wrap width in terminal columns.
+        col_width (int): Minimum target column offset before descriptions begin.
+        indent (int): Leading space indentation for unboxed item rows.
         show_defaults (bool): Append `[default: ...]` / `[required]` hints to option descriptions.
         show_env (bool): Append `[env: ...]` hints to parameters backed by `Arg.env`.
+        show_types (bool): Display uppercase `TYPE` / choices column inside parameter sections.
+        boxed (bool): Wrap help sections and interactive parse errors in Unicode/ASCII panels.
+        box_style (BoxStyle): Border glyph specification (`BoxStyle.ROUNDED` by default).
     """
 
     max_width: int = 100
@@ -629,6 +642,44 @@ class HelpFormatter:
     indent: int = 2
     show_defaults: bool = True
     show_env: bool = True
+    show_types: bool = True
+    boxed: bool = True
+    box_style: BoxStyle = BoxStyle.ROUNDED
+
+    def should_box(self, *, agent_mode: bool | None = None) -> bool:
+        r"""Return `True` when boxed panel rendering should be active for the current environment."""
+        if not self.boxed or agent_mode is True:
+            return False
+        if agent_mode is None and os.environ.get("CLIO_AGENT", "").strip().lower() in ("1", "true", "yes", "on"):
+            return False
+        return os.environ.get("TERM") != "dumb"
+
+    def effective_width(self) -> int:
+        r"""Resolve flush panel width as `min(terminal_columns, max_width)` (minimum 40 columns)."""
+        term_cols = shutil.get_terminal_size(fallback=(self.max_width, 24)).columns
+        detected = term_cols if term_cols > 0 else self.max_width
+        return max(40, min(detected, self.max_width))
+
+    def format_error_box(
+        self,
+        message: str,
+        *,
+        suggestions: Sequence[str] = (),
+        title: str = "Error",
+    ) -> str:
+        r"""Render a red-bordered interactive error panel with optional fuzzy match hints."""
+        lines = [message]
+        if suggestions:
+            styled_first = Colors.info(suggestions[0])
+            lines.append(f"💡 Did you mean '{styled_first}'?")
+        return Colors.box(
+            lines,
+            title=title,
+            width=self.effective_width(),
+            box_style=self.box_style,
+            border_style=_ERROR_BORDER_STYLE,
+            title_style=_ERROR_TITLE_STYLE,
+        )
 
     def format_usage(
         self,
@@ -649,7 +700,7 @@ class HelpFormatter:
         Returns:
             str: Formatted usage line ending in a newline.
         """
-        parts: list[str] = [f"{Colors.info('usage: ')}{prog}"]
+        parts: list[str] = [f"{Colors.info('usage: ')}{Colors.bold(prog)}"]
         if has_options:
             parts.append(Colors.info("[options]"))
 
@@ -664,40 +715,6 @@ class HelpFormatter:
             parts.append(Colors.info("[subcommand]"))
 
         return " ".join(parts) + "\n"
-
-    def _format_row(self, left: str, right: str) -> str:
-        pad = " " * self.indent
-        vis_left = Colors.visible_len(left)
-        target_col = max(self.col_width, self.indent + 4)
-        inner_col = target_col - self.indent
-
-        if not right:
-            return f"{pad}{left}"
-
-        wrap_width = max(30, self.max_width - target_col)
-        raw_paragraphs = right.splitlines() or [""]
-        wrapped_lines: list[str] = []
-        for para in raw_paragraphs:
-            if not para.strip():
-                wrapped_lines.append("")
-                continue
-            # Preserve ANSI sequences by wrapping when visible length exceeds wrap_width
-            if Colors.visible_len(para) <= wrap_width:
-                wrapped_lines.append(para)
-            else:
-                wrapped_lines.extend(textwrap.wrap(para, width=wrap_width) or [para])
-
-        cont_indent = " " * target_col
-        if vis_left <= inner_col - 2:
-            gap = " " * (inner_col - vis_left)
-            first = f"{pad}{left}{gap}{wrapped_lines[0]}"
-            if len(wrapped_lines) == 1:
-                return first
-            rest = "\n".join(f"{cont_indent}{line}" for line in wrapped_lines[1:])
-            return f"{first}\n{rest}"
-
-        body = "\n".join(f"{cont_indent}{line}" for line in wrapped_lines)
-        return f"{pad}{left}\n{body}"
 
     def _describe_spec(self, spec: ParameterSpec, *, is_option: bool) -> str:
         chunks: list[str] = []
@@ -719,6 +736,126 @@ class HelpFormatter:
 
         return " ".join(chunks)
 
+    def _spec_to_row(self, spec: ParameterSpec) -> tuple[str, str, str, str, str]:
+        r"""Convert a `ParameterSpec` into `(req, primary, short, type_badge, description)` columns."""
+        req_cell = Colors.error("*") if spec.is_required else " "
+        if spec.is_positional:
+            primary_cell = Colors.cyan(spec.name, bold=True)
+            short_cell = ""
+        else:
+            flag_list = list(spec.option_flags)
+            if spec.show_negated_in_help and spec.negated_flag is not None and spec.negated_flag not in flag_list:
+                flag_list.append(spec.negated_flag)
+            long_flags = [f for f in flag_list if f.startswith("--")]
+            short_flags = [f for f in flag_list if not f.startswith("--")]
+            primary_cell = ", ".join(Colors.cyan(f, bold=True) for f in long_flags)
+            short_cell = ", ".join(Colors.green(f, bold=True) for f in short_flags)
+
+        badge = spec.badge_label if self.show_types else ""
+        type_cell = Colors.yellow(badge) if badge else ""
+        desc = self._describe_spec(spec, is_option=not spec.is_positional)
+        return (req_cell, primary_cell, short_cell, type_cell, desc)
+
+    @staticmethod
+    def _flag_pair_to_row(flags: Sequence[str], desc: str) -> tuple[str, str, str, str, str]:
+        r"""Convert built-in global/agent flag strings and description into a 5-column row."""
+        long_flags = [f for f in flags if f.startswith("--")]
+        short_flags = [f for f in flags if not f.startswith("--")]
+        primary_cell = ", ".join(Colors.cyan(f, bold=True) for f in long_flags)
+        short_cell = ", ".join(Colors.green(f, bold=True) for f in short_flags)
+        return (" ", primary_cell, short_cell, "", desc)
+
+    def _render_table_lines(
+        self,
+        rows: Sequence[tuple[str, str, str, str, str]],
+        *,
+        avail_width: int,
+        lead_indent: int,
+    ) -> list[str]:
+        r"""Format 5-column rows into aligned, ANSI-wrapped terminal lines within `avail_width`."""
+        has_req = any(bool(r[0]) for r in rows)
+        max_prim_cap = max(16, avail_width // 2 - 6)
+        prim_widths = [Colors.display_width(r[1]) for r in rows]
+        fitting_prims = [w for w in prim_widths if w <= max_prim_cap]
+        prim_w = max(fitting_prims) if fitting_prims else min(max_prim_cap, max(prim_widths, default=0))
+        short_w = max((Colors.display_width(r[2]) for r in rows), default=0)
+        type_w = max((Colors.display_width(r[3]) for r in rows), default=0)
+
+        lead = " " * lead_indent
+        base_prefix_w = (
+            lead_indent
+            + (3 if has_req else 0)
+            + prim_w
+            + ((2 + short_w) if short_w else 0)
+            + ((2 + type_w) if type_w else 0)
+        )
+        min_col = min(self.col_width, max(16, avail_width // 2))
+        desc_col = min(max(base_prefix_w + 2, min_col), max(16, avail_width - 20))
+        desc_w = max(18, avail_width - desc_col)
+        cont_pad = " " * desc_col
+
+        out: list[str] = []
+        for req_c, prim_c, short_c, type_c, desc_c in rows:
+            p_vis = Colors.display_width(prim_c)
+            s_vis = Colors.display_width(short_c)
+            t_vis = Colors.display_width(type_c)
+            req_part = f"{req_c}  " if has_req else ""
+
+            if p_vis <= prim_w:
+                parts = [f"{lead}{req_part}{prim_c}{' ' * (prim_w - p_vis)}"]
+                if short_w:
+                    parts.append(f"  {short_c}{' ' * (short_w - s_vis)}")
+                if type_w:
+                    parts.append(f"  {type_c}{' ' * (type_w - t_vis)}")
+                prefix = "".join(parts)
+                prefix_vis = base_prefix_w
+            else:
+                compact = "  ".join(c for c in (prim_c, short_c, type_c) if c)
+                prefix = f"{lead}{req_part}{compact}"
+                prefix_vis = Colors.display_width(prefix)
+
+            if not desc_c:
+                out.append(prefix.rstrip())
+                continue
+
+            wrapped = Colors.wrap_ansi(desc_c, desc_w)
+            if prefix_vis <= desc_col - 2:
+                gap = " " * (desc_col - prefix_vis)
+                out.append(f"{prefix}{gap}{wrapped[0]}")
+                for cont in wrapped[1:]:
+                    out.append(f"{cont_pad}{cont}")
+            else:
+                out.append(prefix.rstrip())
+                for cont in wrapped:
+                    out.append(f"{cont_pad}{cont}")
+
+        return out
+
+    def _render_section(
+        self,
+        title: str,
+        rows: Sequence[tuple[str, str, str, str, str]],
+        *,
+        boxed: bool,
+        outer_width: int,
+    ) -> str:
+        r"""Render a single help section either inside a `Colors.box` panel or as an indented section."""
+        if boxed:
+            lines = self._render_table_lines(rows, avail_width=max(24, outer_width - 4), lead_indent=0)
+            return Colors.box(
+                lines,
+                title=title,
+                width=outer_width,
+                padding=1,
+                box_style=self.box_style,
+                border_style=_PANEL_BORDER_STYLE,
+                title_style=_PANEL_TITLE_STYLE,
+            )
+
+        lines = self._render_table_lines(rows, avail_width=outer_width, lead_indent=self.indent)
+        heading = Colors.info(Colors.bold(f"{title}:"))
+        return "\n".join((heading, *lines))
+
     def format_help(
         self,
         prog: str,
@@ -731,6 +868,7 @@ class HelpFormatter:
         has_version: bool = False,
         enable_agent_flags: bool = False,
         allow_mcp: bool = False,
+        agent_mode: bool | None = None,
     ) -> str:
         r"""Render complete multi-section ANSI help output for a root `Cli`, `CommandGroup`, or `Command`.
 
@@ -744,6 +882,7 @@ class HelpFormatter:
             has_version (bool): Whether `-v` / `--version` is registered.
             enable_agent_flags (bool): Whether `🤖 Agent options` are registered.
             allow_mcp (bool): Whether `--mcp` is included in `🤖 Agent options`.
+            agent_mode (bool): Explicit agent-mode flag overriding environment detection when `True`.
 
         Returns:
             str: Complete formatted help text ending with a newline.
@@ -752,62 +891,102 @@ class HelpFormatter:
         options = scan_plan.options if scan_plan is not None else ()
         shadowed = scan_plan.flag_map if scan_plan is not None else {}
 
+        use_boxes = self.should_box(agent_mode=agent_mode)
+        outer_width = self.effective_width()
+
         usage = self.format_usage(
             prog,
             positionals=positionals,
             has_options=True,
             has_subcommands=bool(subcommands),
         )
-        sections: list[str] = [usage.rstrip("\n")]
-
+        header_blocks: list[str] = [usage.rstrip("\n")]
         if description and description.strip():
-            sections.append(Colors.bold(description.strip()))
+            header_blocks.append(Colors.bold(description.strip()))
 
-        if positionals:
-            pos_lines = [Colors.info("Positional arguments:")]
-            for pos in positionals:
-                choices = pos.choices_tuple
-                left = f"{pos.name} {pos.metavar_label}" if choices is not None else pos.name
-                pos_lines.append(self._format_row(left, self._describe_spec(pos, is_option=False)))
-            sections.append("\n".join(pos_lines))
+        panels: list[str] = []
 
-        if options:
-            opt_lines = [Colors.info("Options:")]
-            for opt in options:
-                flag_list = list(opt.option_flags)
-                if opt.annotation is bool:
-                    if opt.show_negated_in_help and opt.negated_flag is not None and opt.negated_flag not in flag_list:
-                        flag_list.append(opt.negated_flag)
-                    left = ", ".join(flag_list)
-                else:
-                    left = f"{', '.join(flag_list)} {opt.metavar_label}"
-                opt_lines.append(self._format_row(left, self._describe_spec(opt, is_option=True)))
-            sections.append("\n".join(opt_lines))
+        ungrouped_pos = [p for p in positionals if p.group is None]
+        if ungrouped_pos:
+            panels.append(
+                self._render_section(
+                    "Positional arguments",
+                    [self._spec_to_row(p) for p in ungrouped_pos],
+                    boxed=use_boxes,
+                    outer_width=outer_width,
+                )
+            )
+
+        ungrouped_opts = [o for o in options if o.group is None]
+        if ungrouped_opts:
+            panels.append(
+                self._render_section(
+                    "Options",
+                    [self._spec_to_row(o) for o in ungrouped_opts],
+                    boxed=use_boxes,
+                    outer_width=outer_width,
+                )
+            )
+
+        grouped: dict[str, list[ParameterSpec]] = {}
+        for spec in (*positionals, *options):
+            if spec.group is not None:
+                grouped.setdefault(spec.group, []).append(spec)
+
+        for group_name, group_specs in grouped.items():
+            panels.append(
+                self._render_section(
+                    group_name,
+                    [self._spec_to_row(s) for s in group_specs],
+                    boxed=use_boxes,
+                    outer_width=outer_width,
+                )
+            )
 
         if subcommands:
-            sub_heading = Colors.info(Colors.bold(f"{subcommands_title}:"))
-            sub_lines = [sub_heading]
-            for sub_name, sub_aliases, sub_summary in subcommands:
-                label = f"{sub_name} ({', '.join(sub_aliases)})" if sub_aliases else sub_name
-                sub_lines.append(self._format_row(label, sub_summary))
-            sections.append("\n".join(sub_lines))
+            sub_rows = [
+                (
+                    "",
+                    Colors.cyan(
+                        f"{sub_name} ({', '.join(sub_aliases)})" if sub_aliases else sub_name,
+                        bold=True,
+                    ),
+                    "",
+                    "",
+                    sub_summary,
+                )
+                for sub_name, sub_aliases, sub_summary in subcommands
+            ]
+            panels.append(
+                self._render_section(
+                    subcommands_title,
+                    sub_rows,
+                    boxed=use_boxes,
+                    outer_width=outer_width,
+                )
+            )
 
-        global_rows: list[tuple[str, str]] = []
+        global_rows: list[tuple[str, str, str, str, str]] = []
         help_flags = [f for f in ("-h", "--help") if f not in shadowed]
         if help_flags:
-            global_rows.append((", ".join(help_flags), "Show this help message and exit"))
+            global_rows.append(self._flag_pair_to_row(help_flags, "Show this help message and exit"))
         verbose_flags = [f for f in ("-V", "--verbose") if f not in shadowed]
         if verbose_flags:
-            global_rows.append((", ".join(verbose_flags), "Enable verbose output/progress"))
+            global_rows.append(self._flag_pair_to_row(verbose_flags, "Enable verbose output/progress"))
         if has_version:
             ver_flags = [f for f in ("-v", "--version") if f not in shadowed]
             if ver_flags:
-                global_rows.append((", ".join(ver_flags), "Show program's version number and exit"))
+                global_rows.append(self._flag_pair_to_row(ver_flags, "Show program's version number and exit"))
 
         if global_rows:
-            g_heading = Colors.info(Colors.bold("🌎 Global options:"))
-            g_lines = [g_heading, *(self._format_row(left, right) for left, right in global_rows)]
-            sections.append("\n".join(g_lines))
+            panels.append(
+                self._render_section(
+                    "🌎 Global options",
+                    global_rows,
+                    boxed=use_boxes,
+                    outer_width=outer_width,
+                )
+            )
 
         if enable_agent_flags:
             agent_candidates: list[tuple[str, str]] = [
@@ -820,16 +999,27 @@ class HelpFormatter:
             if allow_mcp:
                 agent_candidates.append(("--mcp", "Start stdio Model Context Protocol (MCP) JSON-RPC server"))
 
-            agent_rows = [(flag, desc) for flag, desc in agent_candidates if flag not in shadowed]
+            agent_rows = [
+                self._flag_pair_to_row((flag,), desc) for flag, desc in agent_candidates if flag not in shadowed
+            ]
             if agent_rows:
-                a_heading = Colors.info(Colors.bold("🤖 Agent options:"))
-                a_lines = [a_heading, *(self._format_row(left, right) for left, right in agent_rows)]
-                sections.append("\n".join(a_lines))
+                panels.append(
+                    self._render_section(
+                        "🤖 Agent options",
+                        agent_rows,
+                        boxed=use_boxes,
+                        outer_width=outer_width,
+                    )
+                )
 
+        body_blocks: list[str] = ["\n\n".join(header_blocks)]
+        if panels:
+            panel_sep = "\n" if use_boxes else "\n\n"
+            body_blocks.append(panel_sep.join(panels))
         if epilog and epilog.strip():
-            sections.append(Colors.bold(epilog.strip()))
+            body_blocks.append(Colors.bold(epilog.strip()))
 
-        return "\n\n".join(sections) + "\n"
+        return "\n\n".join(body_blocks) + "\n"
 
 
 _DEFAULT_FORMATTER = HelpFormatter()

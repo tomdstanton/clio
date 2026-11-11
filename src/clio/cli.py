@@ -17,17 +17,9 @@ from clio.agent import (
     _OutputCaptureContext,
 )
 from clio.color import Colors
-from clio.command import (
-    BaseCommand,
-    Command,
-    CommandTarget,
-    _escape_md_cell,
-    _format_spec_default,
-    _format_spec_description,
-    _format_spec_type,
-    _LazyCommandEntry,
-)
+from clio.command import BaseCommand, Command, CommandTarget, _LazyCommandEntry
 from clio.docstr import DocstringParser
+from clio.markdown import MarkdownWriter
 from clio.parser import _DEFAULT_FORMATTER, CliError, HelpFormatter, ParseError, ScanResult, _fuzzy_suggest
 from clio.spinner import _DEFAULT_SPINNER_CONFIG, Spinner, SpinnerConfig
 
@@ -456,6 +448,7 @@ class Cli:
                 has_version=self.config.version is not None,
                 enable_agent_flags=self.config.enable_agent_flags,
                 allow_mcp=self.config.enable_agent_flags,
+                agent_mode=self.agent_mode,
             )
 
         sub_rows = tuple((entry.name, entry.aliases, entry.summary()) for entry in self._entries)
@@ -469,30 +462,8 @@ class Cli:
             has_version=self.config.version is not None,
             enable_agent_flags=self.config.enable_agent_flags,
             allow_mcp=self.config.enable_agent_flags,
+            agent_mode=self.agent_mode,
         )
-
-    def _global_markdown_rows(self, *, shadowed: Mapping[str, Any] | None = None) -> list[str]:
-        skip = shadowed or {}
-        rows: list[str] = []
-        if "-h" not in skip and "--help" not in skip:
-            rows.append("| `-h`, `--help` | `bool` | `False` | Show this help message and exit |")
-        if "-V" not in skip and "--verbose" not in skip:
-            rows.append("| `-V`, `--verbose` | `bool` | `False` | Enable verbose output/progress |")
-        if self.config.version is not None and "-v" not in skip and "--version" not in skip:
-            rows.append("| `-v`, `--version` | `str` | `None` | Show program's version number and exit |")
-        if self.config.enable_agent_flags:
-            agent_specs = (
-                ("--json", "Emit structured JSON execution envelope"),
-                ("--dry-run", "Validate arguments and inspect resolved CallPlan without executing"),
-                ("--schema", "Print JSON Schema specification and exit"),
-                ("--help-md", "Print Markdown reference documentation and exit"),
-                ("--skill", "Print Agent SKILL.md specification and exit"),
-                ("--mcp", "Start stdio Model Context Protocol (MCP) JSON-RPC server"),
-            )
-            for flag, desc in agent_specs:
-                if flag not in skip:
-                    rows.append(f"| `{flag}` | `bool` | `False` | {desc} |")
-        return rows
 
     def to_markdown(
         self,
@@ -510,73 +481,46 @@ class Cli:
             str: Complete Markdown reference documentation for the CLI and all registered commands.
         """
         prog = self.prog
-        hashes = "#" * max(1, heading_level)
-        lines: list[str] = [f"{hashes} `{prog}`"]
-
         root_cmd = self.root_command
         desc_text = self.config.description or (root_cmd.description if root_cmd is not None else None)
-        if desc_text:
-            lines.append(f"\n{Colors.strip_ansi(desc_text).strip()}")
-
-        usage = Colors.strip_ansi(self.format_usage()).strip()
-        lines.append(f"\n```text\n{usage}\n```")
+        md = (
+            MarkdownWriter()
+            .heading(f"`{prog}`", level=heading_level)
+            .paragraph(desc_text)
+            .code_block(self.format_usage())
+        )
 
         if root_cmd is not None:
             scan_plan = root_cmd.get_scan_plan()
-            if scan_plan.positionals:
-                lines.append("\n**Positional Arguments**\n")
-                lines.append("| Argument | Type / Choices | Description |")
-                lines.append("| :--- | :--- | :--- |")
-                for pos in scan_plan.positionals:
-                    lines.append(f"| `{pos.name}` | {_format_spec_type(pos)} | {_format_spec_description(pos)} |")
-
-            option_rows: list[str] = []
-            for opt in scan_plan.options:
-                flag_list = list(opt.option_flags)
-                if opt.show_negated_in_help and opt.negated_flag is not None and opt.negated_flag not in flag_list:
-                    flag_list.append(opt.negated_flag)
-                flags = ", ".join(f"`{f}`" for f in flag_list)
-                option_rows.append(
-                    f"| {flags} | {_format_spec_type(opt)} | {_format_spec_default(opt)} | {_format_spec_description(opt)} |"
-                )
-            option_rows.extend(self._global_markdown_rows(shadowed=scan_plan.flag_map))
-            if option_rows:
-                lines.append("\n**Options**\n")
-                lines.append("| Flag | Type / Choices | Default | Description |")
-                lines.append("| :--- | :--- | :--- | :--- |")
-                lines.extend(option_rows)
+            extra_rows = MarkdownWriter.global_option_rows(
+                shadowed=scan_plan.flag_map,
+                version=self.config.version,
+                enable_agent_flags=self.config.enable_agent_flags,
+                allow_mcp=self.config.enable_agent_flags,
+            )
+            md.parameter_sections(scan_plan.positionals, scan_plan.options, extra_option_rows=extra_rows)
         else:
-            global_rows = self._global_markdown_rows()
-            if global_rows:
-                lines.append("\n**Global Options**\n")
-                lines.append("| Flag | Type / Choices | Default | Description |")
-                lines.append("| :--- | :--- | :--- | :--- |")
-                lines.extend(global_rows)
-
+            global_rows = MarkdownWriter.global_option_rows(
+                version=self.config.version,
+                enable_agent_flags=self.config.enable_agent_flags,
+                allow_mcp=self.config.enable_agent_flags,
+            )
+            md.option_table((), extra_rows=global_rows, title="Global Options")
             resolved_cmds = self.commands
-            if resolved_cmds:
-                lines.append("\n**Commands**\n")
-                lines.append("| Command | Aliases | Summary |")
-                lines.append("| :--- | :--- | :--- |")
-                for cmd in resolved_cmds:
-                    aliases_cell = ", ".join(f"`{a}`" for a in cmd.aliases) if cmd.aliases else "—"
-                    summary = _escape_md_cell(cmd.help_text or cmd.description)
-                    lines.append(f"| `{cmd.name}` | {aliases_cell} | {summary} |")
-
-                for cmd in resolved_cmds:
-                    lines.append(
-                        "\n"
-                        + cmd.to_markdown(
-                            heading_level=heading_level + 1,
-                            prog_prefix=prog,
-                            include_global_options=include_global_options,
-                        )
+            md.command_table([(c.name, c.aliases, c.help_text or c.description) for c in resolved_cmds])
+            for cmd in resolved_cmds:
+                md.raw(
+                    cmd.to_markdown(
+                        heading_level=heading_level + 1,
+                        prog_prefix=prog,
+                        include_global_options=include_global_options,
                     )
+                )
 
         if self.config.epilog:
-            lines.append(f"\n---\n\n{Colors.strip_ansi(self.config.epilog).strip()}")
+            md.rule().paragraph(self.config.epilog)
 
-        return "\n".join(lines)
+        return md.render()
 
     def to_tools(self) -> list[ToolSpec]:
         r"""Flatten all executable commands registered on this CLI into [`ToolSpec`][clio.agent.ToolSpec] definitions.
@@ -622,41 +566,32 @@ class Cli:
             str: Formatted `SKILL.md` documentation string.
         """
         prog = self.prog or "cli"
-        skill_name = prog.replace(" ", "-").replace("_", "-").lower()
         root_cmd = self.root_command
-        raw_desc = Colors.strip_ansi(
+        raw_desc = (
             self.config.description
             or (root_cmd.description if root_cmd is not None else "")
             or f"Execute {prog} CLI commands."
-        ).strip()
-        summary_line = " ".join(raw_desc.splitlines())
-
-        lines: list[str] = [
-            "---",
-            f"name: {skill_name}",
-            f"description: {summary_line}",
-            "---",
-            "",
-            f"# `{prog}` Agent Skill",
-            "",
-            "## Agent Execution & Introspection",
-            "",
-            "- Set `CLIO_AGENT=1` in the environment for concise, token-efficient error messages and to disable interactive `\r` progress spinners.",
+        )
+        tips = [
+            r"Set `CLIO_AGENT=1` in the environment for concise, token-efficient error messages and to disable interactive `\r` progress spinners.",
         ]
         if self.config.enable_agent_flags:
             cmd_placeholder = "" if root_cmd is not None else " <command>"
-            lines.extend(
-                [
-                    f"- Pass `--json` (e.g. `{prog}{cmd_placeholder} --json`) to receive a structured JSON envelope (`ok`, `command`, `result`, `messages`, `error`).",
-                    f"- Pass `--dry-run` (e.g. `{prog}{cmd_placeholder} ... --dry-run`) to validate arguments and inspect resolved parameter bindings without side effects.",
-                    f"- Run `{prog} --schema` to inspect the full JSON Schema and tool definitions.",
-                    f"- Run `{prog} --help-md` to render Markdown reference documentation.",
-                    f"- Run `{prog} --mcp` to start a stdio Model Context Protocol (MCP) JSON-RPC 2.0 server.",
-                ]
+            tips.extend(
+                (
+                    f"Pass `--json` (e.g. `{prog}{cmd_placeholder} --json`) to receive a structured JSON envelope (`ok`, `command`, `result`, `messages`, `error`).",
+                    f"Pass `--dry-run` (e.g. `{prog}{cmd_placeholder} ... --dry-run`) to validate arguments and inspect resolved parameter bindings without side effects.",
+                    f"Run `{prog} --schema` to inspect the full JSON Schema and tool definitions.",
+                    f"Run `{prog} --help-md` to render Markdown reference documentation.",
+                    f"Run `{prog} --mcp` to start a stdio Model Context Protocol (MCP) JSON-RPC 2.0 server.",
+                )
             )
-        lines.append("")
-        lines.append(self.to_markdown(heading_level=2))
-        return "\n".join(lines)
+        return (
+            MarkdownWriter()
+            .skill_header(prog, raw_desc, section_title="Agent Execution & Introspection", tips=tips)
+            .raw(self.to_markdown(heading_level=2))
+            .render()
+        )
 
     def serve_mcp(self, *, stdin: TextIO | None = None, stdout: TextIO | None = None) -> None:
         r"""Launch a blocking stdio Model Context Protocol (MCP) JSON-RPC 2.0 server for this CLI.
@@ -727,24 +662,32 @@ class Cli:
             print(err_result.to_json())
             sys.exit(err.exit_code)
 
-        display_msg = str(err)
-        if err.suggestions:
-            display_msg += f"\n    💡 Did you mean '{Colors.info(err.suggestions[0])}'?"
-
+        cmd_path_str = err.command_path or self.prog
         if self.agent_mode:
-            cmd_path_str = err.command_path or self.prog
+            display_msg = str(err)
+            if err.suggestions:
+                display_msg += f"\n    💡 Did you mean '{Colors.info(err.suggestions[0])}'?"
             usage_line = err.usage or Colors.strip_ansi(self.format_usage()).strip()
             hint_line = f"    Run '{cmd_path_str} --help' for full help."
             print(f"{usage_line}\n{Colors.error('❌ Error:')} {display_msg}\n{hint_line}", file=sys.stderr)
             sys.exit(err.exit_code)
 
-        help_text = (
-            self.format_help()
+        styled_usage = (
+            self.format_usage().rstrip("\n")
             if (target_cmd is None or is_single_root)
-            else target_cmd.format_help(prog_prefix=prog_prefix)
+            else target_cmd.format_usage(prog_prefix=prog_prefix).rstrip("\n")
         )
-        print(help_text, end="", file=sys.stderr)
-        print(f"\n{Colors.error('❌ Error:')} {display_msg}", file=sys.stderr)
+        fmt = self.config.formatter
+        hint_text = Colors.muted(f"Try '{cmd_path_str} --help' for help.")
+        if fmt.should_box(agent_mode=False):
+            error_panel = fmt.format_error_box(str(err), suggestions=err.suggestions)
+            print(f"{styled_usage}\n{hint_text}\n\n{error_panel}", file=sys.stderr)
+            sys.exit(err.exit_code)
+
+        display_msg = str(err)
+        if err.suggestions:
+            display_msg += f"\n    💡 Did you mean '{Colors.info(err.suggestions[0])}'?"
+        print(f"{styled_usage}\n{hint_text}\n\n{Colors.error('❌ Error:')} {display_msg}", file=sys.stderr)
         sys.exit(err.exit_code)
 
     def _prepare_execution(self, args: Sequence[str] | None) -> _PreparedExecution | AgentResult | None:

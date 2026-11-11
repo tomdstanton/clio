@@ -1,5 +1,4 @@
 import dataclasses
-import enum
 import inspect
 import os
 import types
@@ -11,6 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Self, override
 from clio.agent import ToolSpec
 from clio.color import Colors
 from clio.docstr import DocstringParser, DocstringSpec, ParameterSpec
+from clio.markdown import MarkdownWriter
 from clio.parser import _DEFAULT_FORMATTER, HelpFormatter, ScanPlan, _clone_default
 
 if TYPE_CHECKING:
@@ -40,43 +40,6 @@ def _get_cmd_meta(target_cls: type[Any], attr: str, default: Any = "") -> Any:
     if isinstance(val, types.MemberDescriptorType):
         return default
     return val
-
-
-def _format_spec_type(spec: ParameterSpec) -> str:
-    r"""Format the type or allowed choices of a `ParameterSpec` for Markdown tables."""
-    choices = spec.choices_tuple
-    if choices is not None:
-        return ", ".join(f"`{c}`" for c in choices)
-    return f"`{spec.type_label}`"
-
-
-def _format_spec_default(spec: ParameterSpec) -> str:
-    r"""Format the default value or required status of a `ParameterSpec` for Markdown tables."""
-    if spec.is_required:
-        return "*required*"
-    if not spec.has_default or spec.default is None:
-        return "`None`"
-    if isinstance(spec.default, enum.Enum):
-        return f"`{spec.default.value!r}`"
-    return f"`{spec.default!r}`"
-
-
-def _escape_md_cell(text: str | None) -> str:
-    r"""Sanitize text for placement inside a Markdown table cell."""
-    if not text:
-        return ""
-    cleaned = Colors.strip_ansi(text).strip()
-    return " ".join(cleaned.splitlines()).replace("|", r"\|")
-
-
-def _format_spec_description(spec: ParameterSpec) -> str:
-    r"""Format a parameter's Markdown description including `[env: ...]` metadata."""
-    desc = spec.docstring
-    if spec.arg_meta is not None and spec.arg_meta.env:
-        env_tag = f"[env: {spec.arg_meta.env}]"
-        if env_tag not in desc:
-            desc = f"{desc} {env_tag}".strip()
-    return _escape_md_cell(desc)
 
 
 def _coerce_subcommand(cmd: CommandTarget) -> BaseCommand:
@@ -626,6 +589,7 @@ class BaseCommand(ABC):
         r"""Format complete ANSI help output for this command."""
         fmt = formatter or (self.cli.config.formatter if self.cli is not None else _DEFAULT_FORMATTER)
         enable_agent = self.cli.config.enable_agent_flags if self.cli is not None else False
+        is_agent = self.cli.agent_mode if self.cli is not None else None
         full_prog = f"{prog_prefix} {self.name}".strip() if self.name else prog_prefix.strip()
         return fmt.format_help(
             full_prog,
@@ -636,6 +600,7 @@ class BaseCommand(ABC):
             has_version=False,
             enable_agent_flags=enable_agent,
             allow_mcp=False,
+            agent_mode=is_agent,
         )
 
     def to_markdown(
@@ -657,70 +622,33 @@ class BaseCommand(ABC):
         """
         full_prog = f"{prog_prefix} {self.name}".strip()
         scan_plan = self.get_scan_plan()
+        extra_opts = MarkdownWriter.global_option_rows(shadowed=scan_plan.flag_map) if include_global_options else ()
+        alias_line = f"*Aliases:* {', '.join(f'`{a}`' for a in self.aliases)}" if self.aliases else None
 
-        hashes = "#" * max(1, heading_level)
-        lines: list[str] = [f"{hashes} `{full_prog}`"]
-
-        if self.aliases:
-            alias_str = ", ".join(f"`{a}`" for a in self.aliases)
-            lines.append(f"\n*Aliases:* {alias_str}")
-
-        if self.description:
-            lines.append(f"\n{Colors.strip_ansi(self.description).strip()}")
-
-        usage = Colors.strip_ansi(self.format_usage(prog_prefix=prog_prefix)).strip()
-        lines.append(f"\n```text\n{usage}\n```")
-
-        if scan_plan.positionals:
-            lines.append("\n**Positional Arguments**\n")
-            lines.append("| Argument | Type / Choices | Description |")
-            lines.append("| :--- | :--- | :--- |")
-            for pos in scan_plan.positionals:
-                lines.append(f"| `{pos.name}` | {_format_spec_type(pos)} | {_format_spec_description(pos)} |")
-
-        option_rows: list[str] = []
-        for opt in scan_plan.options:
-            flag_list = list(opt.option_flags)
-            if opt.show_negated_in_help and opt.negated_flag is not None and opt.negated_flag not in flag_list:
-                flag_list.append(opt.negated_flag)
-            flags = ", ".join(f"`{f}`" for f in flag_list)
-            option_rows.append(
-                f"| {flags} | {_format_spec_type(opt)} | {_format_spec_default(opt)} | {_format_spec_description(opt)} |"
-            )
-
-        if include_global_options:
-            if "-h" not in scan_plan.flag_map and "--help" not in scan_plan.flag_map:
-                option_rows.append("| `-h`, `--help` | `bool` | `False` | Show this help message and exit |")
-            if "-V" not in scan_plan.flag_map and "--verbose" not in scan_plan.flag_map:
-                option_rows.append("| `-V`, `--verbose` | `bool` | `False` | Enable verbose output/progress |")
-
-        if option_rows:
-            lines.append("\n**Options**\n")
-            lines.append("| Flag | Type / Choices | Default | Description |")
-            lines.append("| :--- | :--- | :--- | :--- |")
-            lines.extend(option_rows)
-
+        md = (
+            MarkdownWriter()
+            .heading(f"`{full_prog}`", level=heading_level)
+            .paragraph(alias_line)
+            .paragraph(self.description)
+            .code_block(self.format_usage(prog_prefix=prog_prefix))
+            .parameter_sections(scan_plan.positionals, scan_plan.options, extra_option_rows=extra_opts)
+        )
         if self.has_subcommands():
             resolved_subs = self.get_subcommands()
-            lines.append("\n**Subcommands**\n")
-            lines.append("| Subcommand | Aliases | Summary |")
-            lines.append("| :--- | :--- | :--- |")
+            md.command_table(
+                [(s.name, s.aliases, s.help_text or s.description) for s in resolved_subs],
+                col_label="Subcommand",
+                title="Subcommands",
+            )
             for sub_cmd in resolved_subs:
-                aliases_cell = ", ".join(f"`{a}`" for a in sub_cmd.aliases) if sub_cmd.aliases else "—"
-                summary = _escape_md_cell(sub_cmd.help_text or sub_cmd.description)
-                lines.append(f"| `{sub_cmd.name}` | {aliases_cell} | {summary} |")
-
-            for sub_cmd in resolved_subs:
-                lines.append(
-                    "\n"
-                    + sub_cmd.to_markdown(
+                md.raw(
+                    sub_cmd.to_markdown(
                         heading_level=heading_level + 1,
                         prog_prefix=full_prog,
                         include_global_options=include_global_options,
                     )
                 )
-
-        return "\n".join(lines)
+        return md.render()
 
     def resolve_arguments(self, values: Mapping[str, Any]) -> dict[str, Any]:
         r"""Resolve parsed parameter values into bound command arguments without executing `__call__`.
@@ -925,33 +853,28 @@ class BaseCommand(ABC):
             str: Complete `SKILL.md` markdown content.
         """
         full_prog = f"{prog_prefix} {self.name}".strip()
-        skill_name = full_prog.replace(" ", "-").replace("_", "-").lower()
-        summary = Colors.strip_ansi(self.help_text or self.description or f"Run {full_prog} CLI command.").strip()
-        summary_line = " ".join(summary.splitlines())
-
-        lines: list[str] = [
-            "---",
-            f"name: {skill_name}",
-            f"description: {summary_line}",
-            "---",
-            "",
-            f"# `{full_prog}` Agent Skill",
-            "",
-            "## Agent Execution Tips",
-            "",
-            "- Set `CLIO_AGENT=1` in the environment to receive token-efficient error messages and disable interactive progress spinners.",
+        tips = [
+            "Set `CLIO_AGENT=1` in the environment to receive token-efficient error messages and disable interactive progress spinners.",
         ]
         if enable_agent_flags:
-            lines.extend(
-                [
-                    f"- Pass `--json` (e.g. `{full_prog} --json ...`) to receive a structured JSON envelope (`ok`, `command`, `result`, `messages`, `error`).",
-                    "- Pass `--dry-run` to validate CLI arguments and inspect resolved parameter bindings without side effects.",
-                    f"- Run `{full_prog} --schema` to inspect the JSON Schema for this command.",
-                ]
+            tips.extend(
+                (
+                    f"Pass `--json` (e.g. `{full_prog} --json ...`) to receive a structured JSON envelope (`ok`, `command`, `result`, `messages`, `error`).",
+                    "Pass `--dry-run` to validate CLI arguments and inspect resolved parameter bindings without side effects.",
+                    f"Run `{full_prog} --schema` to inspect the JSON Schema for this command.",
+                )
             )
-        lines.append("")
-        lines.append(self.to_markdown(heading_level=2, prog_prefix=prog_prefix))
-        return "\n".join(lines)
+        return (
+            MarkdownWriter()
+            .skill_header(
+                full_prog,
+                self.help_text or self.description or f"Run {full_prog} CLI command.",
+                section_title="Agent Execution Tips",
+                tips=tips,
+            )
+            .raw(self.to_markdown(heading_level=2, prog_prefix=prog_prefix))
+            .render()
+        )
 
 
 class CommandGroup(BaseCommand):

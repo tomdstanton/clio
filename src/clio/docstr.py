@@ -152,6 +152,7 @@ class Arg:
         choices (Sequence[Any] | None): Explicit allowed argument values.
         env (str | None): Environment variable name used as a fallback default if set in `os.environ`.
         positional (bool | None): Force positional (`True`) or `--flag` option (`False`) regardless of default value.
+        group (str | None): Named help panel / Markdown table group (e.g. `"Network"` or `"Authentication"`).
     """
 
     short: str | Sequence[str] = ()
@@ -160,6 +161,7 @@ class Arg:
     choices: Sequence[Any] | None = None
     env: str | None = None
     positional: bool | None = None
+    group: str | None = None
 
     @property
     def short_flags(self) -> tuple[str, ...]:
@@ -185,6 +187,7 @@ class Arg:
             choices=other.choices if other.choices is not None else self.choices,
             env=other.env if other.env is not None else self.env,
             positional=other.positional if other.positional is not None else self.positional,
+            group=other.group if other.group is not None else self.group,
         )
 
 
@@ -332,6 +335,51 @@ class ParameterSpec:
             min_tok = 0 if (self.has_default or not self.is_required) else 1
             return (min_tok, None)
         return (1, 1)
+
+    @property
+    def group(self) -> str | None:
+        r"""Named help panel / Markdown table group from `Arg.group`, or `None`."""
+        if self.arg_meta is not None and self.arg_meta.group:
+            return self.arg_meta.group
+        return None
+
+    @staticmethod
+    def _scalar_badge(ann: Any) -> str:
+        r"""Format a concise uppercase terminal type badge for a scalar annotation."""
+        if ann is inspect.Parameter.empty or ann is str or ann in (Any, object):
+            return "TEXT"
+        if ann is int:
+            return "INT"
+        if ann is float:
+            return "FLOAT"
+        if ann is bool:
+            return "BOOL"
+        if isinstance(ann, type) and issubclass(ann, os.PathLike):
+            return "PATH"
+        if ann is dict or get_origin(ann) in (dict, Mapping):
+            return "KEY=VAL"
+        if isinstance(ann, ForwardRef):
+            return ann.__forward_arg__.upper()
+        return type_repr(ann).upper()
+
+    @property
+    def badge_label(self) -> str:
+        r"""Concise type or choices badge rendered in multi-column `--help` panels."""
+        if not self.is_positional and self.annotation is bool:
+            return ""
+        if self.arg_meta is not None and self.arg_meta.metavar is not None:
+            return self.arg_meta.metavar
+        choices = self.choices_tuple
+        if choices is not None:
+            return "{" + "|".join(str(c) for c in choices) + "}"
+        fixed = self.fixed_tuple_types
+        if fixed is not None and fixed:
+            return " ".join(self._scalar_badge(t) for t in fixed)
+        if self.is_variadic_collection:
+            elem_args = get_args(self.annotation)
+            elem = self._scalar_badge(elem_args[0]) if elem_args else "TEXT"
+            return f"{elem}..."
+        return self._scalar_badge(self.annotation)
 
     @property
     def metavar_label(self) -> str:

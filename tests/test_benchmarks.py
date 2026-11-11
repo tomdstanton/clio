@@ -11,6 +11,7 @@ import pytest
 
 from clio import (
     Arg,
+    BoxStyle,
     CallPlan,
     Cli,
     CliConfig,
@@ -23,6 +24,7 @@ from clio import (
     DocstringParser,
     DocstringSpec,
     HelpFormatter,
+    MarkdownWriter,
     OptionBinding,
     PackageMeta,
     ParameterSpec,
@@ -291,6 +293,7 @@ def collect_architecture_footprints() -> tuple[ArchitectureFootprint, ...]:
         (cli_cfg, "clio.cli", "Immutable root CLI configuration and behavior flags"),
         (spinner_cfg, "clio.spinner", "Visual glyph frames, timing interval, and Style for Spinner"),
         (target_spec, "clio.runner", "Parsed zero-edit file/module target specifier (`script.py:fn`)"),
+        (BoxStyle.ROUNDED, "clio.color", "Border glyph specification for boxed help and terminal panels"),
         (style, "clio.color", "Composable ANSI SGR style sequence with pre-compiled prefix"),
     ]
 
@@ -457,6 +460,26 @@ def benchmark_report() -> BenchmarkReport:
     def bench_to_markdown() -> str:
         return runtime_cli.to_markdown()
 
+    # 10. Boxed multi-column ANSI --help rendering
+    case_boxed_help = BenchmarkCase(
+        case_id="cli_format_help_boxed",
+        name="Boxed Multi-Column ANSI Help",
+        category="Docs",
+        description="Render Unicode boxed multi-column `--help` panels via `HelpFormatter` and `Colors.box()`.",
+        iterations=400,
+        max_median_us=1500.0,
+    )
+    deploy_leaf = BenchDeployCommand()
+    bench_fmt = HelpFormatter(boxed=True)
+
+    def bench_boxed_help() -> str:
+        return bench_fmt.format_help(
+            "bench deploy",
+            description=deploy_leaf.description,
+            scan_plan=deploy_leaf.get_scan_plan(),
+            agent_mode=False,
+        )
+
     metrics = (
         _measure_case(case_subclass, bench_subclass_def),
         _measure_case(case_cold_spec, bench_cold_spec),
@@ -467,6 +490,7 @@ def benchmark_report() -> BenchmarkReport:
         _measure_case(case_cli_dataclass, bench_cli_dataclass),
         _measure_case(case_color_style, bench_color_style),
         _measure_case(case_to_markdown, bench_to_markdown),
+        _measure_case(case_boxed_help, bench_boxed_help),
     )
 
     py_ver = f"Python {platform.python_version()} ({platform.python_implementation()})"
@@ -482,118 +506,159 @@ def benchmark_report() -> BenchmarkReport:
 
 def render_benchmark_markdown(report: BenchmarkReport) -> str:
     """Render the BenchmarkReport into a Zensical-compatible Markdown page."""
-    lines: list[str] = [
-        "# Performance & Architecture Benchmarks",
-        "",
-        "`clio` is engineered around a strict **Stateless Specification / Stateful Execution** split",
-        "built natively on Python 3.14's `annotationlib` (PEP 649 / PEP 749) and a custom zero-`argparse`",
-        "token scanner (`ScanPlan`). Expensive introspection (`annotationlib`, `inspect.signature`,",
-        "PEP 695 `TypeAliasType` unwrapping, docstring parsing, `Annotated[T, Arg(...)]` extraction,",
-        "and `@dataclass` field binding) happens **lazily on the matched command path only** and is",
-        "cached in immutable `@dataclass(frozen=True, slots=True)` specifications.",
-        "",
-        '!!! info "Benchmark Environment"',
-        f"    - **Runtime**: `{report.python_version}`",
-        f"    - **Platform**: `{report.platform_label}`",
-        "    - **Suite**: `tests/test_benchmarks.py` (enforced in `pytest` and `prek.toml`)",
-        "",
-        "## Lifecycle Architecture",
-        "",
-        "```mermaid",
-        "flowchart LR",
-        '    A["Lazy Route Indexing\\n(Cli.add_command)"] --> B["O(depth) Subcommand Match\\n(Zero Sibling __annotate__)"]',
-        '    B --> C["Single-Pass Spec Compile\\n(annotationlib + ScanPlan + CallPlan)"]',
-        '    C --> D["O(1) Token Scan & Dispatch\\n(ScanPlan.parse + CallPlan.invoke)"]',
-        "```",
-        "",
-        "## Micro-Benchmark Results",
-        "",
-        "| Benchmark | Category | Median (µs) | Mean (µs) | P95 (µs) | Min (µs) | Throughput (ops/s) | Budget (µs) |",
-        "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-
-    for m in report.metrics:
-        lines.append(
-            f"| **{m.case.name}**<br><small>{m.case.description}</small> "
-            f"| `{m.case.category}` "
-            f"| `{m.median_us:.2f}` "
-            f"| `{m.mean_us:.2f}` "
-            f"| `{m.p95_us:.2f}` "
-            f"| `{m.min_us:.2f}` "
-            f"| `{m.ops_per_sec:,.0f}` "
-            f"| `<= {m.case.max_median_us:.0f}` |"
-        )
-
     chart_labels = ", ".join(f'"{m.case.case_id}"' for m in report.metrics)
     chart_values = ", ".join(f"{m.median_us:.2f}" for m in report.metrics)
     max_y = max(max(m.median_us for m in report.metrics) * 1.15, 50.0)
 
-    lines.extend(
-        [
-            "",
-            "### Median Latency Breakdown (µs)",
-            "",
-            "```mermaid",
-            "xychart-beta",
-            '    title "clio Lifecycle Median Latency (microseconds, lower is better)"',
-            f"    x-axis [{chart_labels}]",
-            f'    y-axis "Latency (us)" 0 --> {max_y:.0f}',
-            f"    bar [{chart_values}]",
-            "```",
-            "",
-            "## Frozen Slotted Specification Footprint",
-            "",
-            "Every specification and configuration object in `clio` uses `@dataclass(frozen=True, slots=True)`",
-            "to eliminate per-instance `__dict__` allocation and prevent accidental state mutation across runs.",
-            "",
-            "| Dataclass | Module | Shallow Size (Bytes) | Frozen | Slotted | Architectural Role |",
-            "| :--- | :--- | ---: | :---: | :---: | :--- |",
-        ]
-    )
-
-    for fp in report.footprints:
-        frozen_badge = "`Yes`" if fp.is_frozen else "`No`"
-        slots_badge = "`Yes`" if fp.has_slots else "`No`"
-        lines.append(
-            f"| [`{fp.struct_name}`](reference.md) | `{fp.module_name}` | `{fp.size_bytes}` "
-            f"| {frozen_badge} | {slots_badge} | {fp.role} |"
+    metric_rows = [
+        (
+            f"**{m.case.name}**<br><small>{m.case.description}</small>",
+            f"`{m.case.category}`",
+            f"`{m.median_us:.2f}`",
+            f"`{m.mean_us:.2f}`",
+            f"`{m.p95_us:.2f}`",
+            f"`{m.min_us:.2f}`",
+            f"`{m.ops_per_sec:,.0f}`",
+            f"`<= {m.case.max_median_us:.0f}`",
         )
-
-    lines.extend(
-        [
-            "",
-            "## Why `clio` Stays Fast vs. `clypi`, `cyclopts` & `typer`",
-            "",
-            "| Dimension | `clio` (Python 3.14+) | `clypi` | `cyclopts` | `typer` |",
-            "| :--- | :--- | :--- | :--- | :--- |",
-            "| **Runtime Dependencies** | **0** (`stdlib` + `annotationlib` only) | `typing-extensions` | `attrs`, `rich`, `docstring-parser` | `click`, `rich`, `shellingham`, `typing-extensions` |",
-            "| **Annotation Engine** | **Native PEP 649 `__annotate__` + `Format.FORWARDREF` + PEP 695 `type`** (lazy on matched route only) | Pydantic-style class field evaluation across tree | `typing.get_type_hints` + `Annotated` inspection | `typing.get_type_hints` + Click `OptionInfo` |",
-            "| **Async & Spinners** | **Pay-only-when-used `async` + thread-backed `Spinner`** (`CLIO_AGENT=1` / `--json` aware) | Always-async `asyncio.run()` + `asyncio` spinner | Sync-first (`rich` spinners external) | Sync-only unless manually wrapped |",
-            "| **Dispatch Overhead** | **Native `ScanPlan` + `CallPlan`** — zero `argparse` / `Namespace` / runtime `inspect` | Class hydration + coroutine loop startup | Runtime token coercion & binding | Click context stack + callback wrapper frames |",
-            "| **Help & Error Rendering** | Direct ANSI SGR (`HelpFormatter`), lazy `difflib` on error only | Custom ANSI formatter | `rich` console layout & table rendering | `rich` traceback & box rendering |",
-            "| **Docs & Agent Native** | Zero-edit `python -m clio script.py[:fn]`, `to_markdown()`, `to_json_schema()`, `SKILL.md`, stdio `McpServer` | Docs only | Sphinx / MkDocs plugin | `typer-cli` external package |",
-            "",
-            "## Running & Updating Benchmarks",
-            "",
-            "Benchmarks execute automatically during `pytest` and `pre-commit` to enforce latency budgets:",
-            "",
-            "```bash",
-            "# Run tests and verify performance budgets",
-            "uv run pytest",
-            "",
-            "# Regenerate docs/benchmarks.md with fresh measurements",
-            "uv run pytest --update-benchmarks",
-            "```",
-            "",
-        ]
+        for m in report.metrics
+    ]
+    footprint_rows = [
+        (
+            f"[`{fp.struct_name}`](reference.md)",
+            f"`{fp.module_name}`",
+            f"`{fp.size_bytes}`",
+            "`Yes`" if fp.is_frozen else "`No`",
+            "`Yes`" if fp.has_slots else "`No`",
+            fp.role,
+        )
+        for fp in report.footprints
+    ]
+    comparison_rows = (
+        (
+            "**Runtime Dependencies**",
+            "**0** (`stdlib` + `annotationlib` only)",
+            "`typing-extensions`",
+            "`attrs`, `rich`, `docstring-parser`",
+            "`click`, `rich`, `shellingham`, `typing-extensions`",
+        ),
+        (
+            "**Annotation Engine**",
+            "**Native PEP 649 `__annotate__` + `Format.FORWARDREF` + PEP 695 `type`** (lazy on matched route only)",
+            "Pydantic-style class field evaluation across tree",
+            "`typing.get_type_hints` + `Annotated` inspection",
+            "`typing.get_type_hints` + Click `OptionInfo`",
+        ),
+        (
+            "**Async & Spinners**",
+            "**Pay-only-when-used `async` + thread-backed `Spinner`** (`CLIO_AGENT=1` / `--json` aware)",
+            "Always-async `asyncio.run()` + `asyncio` spinner",
+            "Sync-first (`rich` spinners external)",
+            "Sync-only unless manually wrapped",
+        ),
+        (
+            "**Dispatch Overhead**",
+            "**Native `ScanPlan` + `CallPlan`** — zero `argparse` / `Namespace` / runtime `inspect`",
+            "Class hydration + coroutine loop startup",
+            "Runtime token coercion & binding",
+            "Click context stack + callback wrapper frames",
+        ),
+        (
+            "**Help & Error Rendering**",
+            "Direct ANSI SGR (`HelpFormatter`), lazy `difflib` on error only",
+            "Custom ANSI formatter",
+            "`rich` console layout & table rendering",
+            "`rich` traceback & box rendering",
+        ),
+        (
+            "**Docs & Agent Native**",
+            "Zero-edit `python -m clio script.py[:fn]`, `to_markdown()`, `to_json_schema()`, `SKILL.md`, stdio `McpServer`",
+            "Docs only",
+            "Sphinx / MkDocs plugin",
+            "`typer-cli` external package",
+        ),
     )
 
-    return "\n".join(lines)
+    md = (
+        MarkdownWriter()
+        .heading("Performance & Architecture Benchmarks", level=1)
+        .paragraph(
+            "`clio` is engineered around a strict **Stateless Specification / Stateful Execution** split\n"
+            "built natively on Python 3.14's `annotationlib` (PEP 649 / PEP 749) and a custom zero-`argparse`\n"
+            "token scanner (`ScanPlan`). Expensive introspection (`annotationlib`, `inspect.signature`,\n"
+            "PEP 695 `TypeAliasType` unwrapping, docstring parsing, `Annotated[T, Arg(...)]` extraction,\n"
+            "and `@dataclass` field binding) happens **lazily on the matched command path only** and is\n"
+            "cached in immutable `@dataclass(frozen=True, slots=True)` specifications."
+        )
+        .admonition(
+            "info",
+            "Benchmark Environment",
+            (
+                f"- **Runtime**: `{report.python_version}`",
+                f"- **Platform**: `{report.platform_label}`",
+                "- **Suite**: `tests/test_benchmarks.py` (enforced in `pytest` and `prek.toml`)",
+            ),
+        )
+        .heading("Lifecycle Architecture", level=2)
+        .code_block(
+            "flowchart LR\n"
+            '    A["Lazy Route Indexing\\n(Cli.add_command)"] --> B["O(depth) Subcommand Match\\n(Zero Sibling __annotate__)"]\n'
+            '    B --> C["Single-Pass Spec Compile\\n(annotationlib + ScanPlan + CallPlan)"]\n'
+            '    C --> D["O(1) Token Scan & Dispatch\\n(ScanPlan.parse + CallPlan.invoke)"]',
+            lang="mermaid",
+        )
+        .heading("Micro-Benchmark Results", level=2)
+        .table(
+            (
+                "Benchmark",
+                "Category",
+                "Median (µs)",
+                "Mean (µs)",
+                "P95 (µs)",
+                "Min (µs)",
+                "Throughput (ops/s)",
+                "Budget (µs)",
+            ),
+            metric_rows,
+            alignments=("left", "left", "right", "right", "right", "right", "right", "right"),
+        )
+        .heading("Median Latency Breakdown (µs)", level=3)
+        .code_block(
+            "xychart-beta\n"
+            '    title "clio Lifecycle Median Latency (microseconds, lower is better)"\n'
+            f"    x-axis [{chart_labels}]\n"
+            f'    y-axis "Latency (us)" 0 --> {max_y:.0f}\n'
+            f"    bar [{chart_values}]",
+            lang="mermaid",
+        )
+        .heading("Frozen Slotted Specification Footprint", level=2)
+        .paragraph(
+            "Every specification and configuration object in `clio` uses `@dataclass(frozen=True, slots=True)`\n"
+            "to eliminate per-instance `__dict__` allocation and prevent accidental state mutation across runs."
+        )
+        .table(
+            ("Dataclass", "Module", "Shallow Size (Bytes)", "Frozen", "Slotted", "Architectural Role"),
+            footprint_rows,
+            alignments=("left", "left", "right", "center", "center", "left"),
+        )
+        .heading("Why `clio` Stays Fast vs. `clypi`, `cyclopts` & `typer`", level=2)
+        .table(("Dimension", "`clio` (Python 3.14+)", "`clypi`", "`cyclopts`", "`typer`"), comparison_rows)
+        .heading("Running & Updating Benchmarks", level=2)
+        .paragraph("Benchmarks execute automatically during `pytest` and `prek` to enforce latency budgets:")
+        .code_block(
+            "# Run tests and verify performance budgets\n"
+            "uv run pytest\n\n"
+            "# Regenerate docs/benchmarks.md with fresh measurements\n"
+            "uv run pytest --update-benchmarks",
+            lang="bash",
+        )
+    )
+    return f"{md.render()}\n"
 
 
 def test_all_specs_are_frozen_and_slotted(benchmark_report: BenchmarkReport) -> None:
     """Verify every core clio specification dataclass is both frozen and slotted."""
-    assert len(benchmark_report.footprints) == 15
+    assert len(benchmark_report.footprints) == 16
     for footprint in benchmark_report.footprints:
         assert footprint.is_frozen, f"{footprint.struct_name} must be frozen=True"
         assert footprint.has_slots, f"{footprint.struct_name} must be slots=True (no __dict__)"

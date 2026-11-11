@@ -28,7 +28,7 @@ typing = [
 ]
 lint = [
     "ruff",
-    "pre-commit",
+    "prek",
 ]
 dev = [
     { include-group = "docs" },

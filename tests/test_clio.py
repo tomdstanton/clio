@@ -25,6 +25,7 @@ from clio import (
     AgentResult,
     Arg,
     BaseCommand,
+    BoxStyle,
     CallPlan,
     Cli,
     CliConfig,
@@ -37,6 +38,7 @@ from clio import (
     DocstringSpec,
     FunctionCommand,
     HelpFormatter,
+    MarkdownWriter,
     McpServer,
     OptionBinding,
     PackageMeta,
@@ -180,6 +182,8 @@ def test_help_formatter_renders_clean_synopsis_and_sections(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(Colors, "ENABLED", False)
+    monkeypatch.delenv("CLIO_AGENT", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
     cli = Cli(
         prog="mytool",
         description="Top level tool",
@@ -194,8 +198,8 @@ def test_help_formatter_renders_clean_synopsis_and_sections(
     assert "usage: mytool [options] [subcommand]" in help_output
     assert "{leafcommand" not in help_output
     assert "Top level tool" in help_output
-    assert "🌎 Global options:" in help_output
-    assert "💬 Commands:" in help_output
+    assert "╭─ 🌎 Global options" in help_output
+    assert "╭─ 💬 Commands" in help_output
     assert "leafcommand (lf)" in help_output
     assert "Footer note." in help_output
 
@@ -205,6 +209,8 @@ def test_parse_error_fuzzy_subcommand_suggestion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(Colors, "ENABLED", False)
+    monkeypatch.delenv("CLIO_AGENT", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
     cli = Cli(prog="mytool", commands=[LeafCommand])
 
     with pytest.raises(SystemExit) as exc_info:
@@ -213,7 +219,9 @@ def test_parse_error_fuzzy_subcommand_suggestion(
     assert exc_info.value.code == 2
     stderr = capsys.readouterr().err
     assert "usage: mytool" in stderr
-    assert "❌ Error: argument command: invalid choice: 'leafcomman'" in stderr
+    assert "Try 'mytool --help' for help." in stderr
+    assert "╭─ Error" in stderr
+    assert "argument command: invalid choice: 'leafcomman'" in stderr
     assert "💡 Did you mean 'leafcommand'?" in stderr
 
 
@@ -527,7 +535,7 @@ def test_annotated_short_flags_and_docstring_help_backfill(
     cli = Cli(prog="mytool", commands=[cmd])
 
     help_out = cmd.format_help(prog_prefix="mytool")
-    assert "-n, --name" in help_out
+    assert "--name" in help_out and "-n" in help_out
     assert "Documented name help from docstring." in help_out
     assert "--retries" in help_out
     assert "Number of retry attempts." in help_out
@@ -2239,9 +2247,20 @@ if __name__ == "__main__":
     assert "clio: error:" in capsys.readouterr().err
 
     monkeypatch.delenv("CLIO_AGENT", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
     with pytest.raises(SystemExit):
         runner_main([f"{ext_script}:summarize_record"])
-    assert "Did you mean:" in capsys.readouterr().err
+    runner_err = capsys.readouterr().err
+    assert "Error" in runner_err
+    assert "Did you mean" in runner_err and "summarize_records" in runner_err
+
+    # Unboxed runner error fallback (`TERM=dumb`)
+    monkeypatch.setenv("TERM", "dumb")
+    with pytest.raises(SystemExit):
+        runner_main([f"{ext_script}:summarize_record"])
+    dumb_err = capsys.readouterr().err
+    assert "Did you mean:" in dumb_err
+    monkeypatch.setenv("TERM", "xterm-256color")
 
     # Execute `clio/__main__.py` directly via `runpy.run_module("clio", run_name="__main__")`
     monkeypatch.setattr(sys, "argv", ["clio", f"{ext_script}:summarize_records", "report.md", "--limit", "2", "--json"])
@@ -2249,3 +2268,198 @@ if __name__ == "__main__":
     dunder_out = json.loads(capsys.readouterr().out)
     assert dunder_out["ok"] is True
     assert dunder_out["result"] == {"label": "report.md", "limit": 2}
+
+
+def test_markdown_writer_primitives_and_edge_cases() -> None:
+    """Verify MarkdownWriter GFM block builders, escaping, and empty no-op guards."""
+    assert MarkdownWriter.escape_cell(None) == ""
+    assert MarkdownWriter.escape_cell("") == ""
+    assert MarkdownWriter.escape_cell("\x1b[31ma|b\nc\x1b[0m") == r"a\|b c"
+
+    writer = (
+        MarkdownWriter()
+        .frontmatter({})
+        .frontmatter({"name": "demo", "description": "Line 1\nLine 2"})
+        .heading("Section", level=2)
+        .paragraph(None)
+        .paragraph("   ")
+        .paragraph("Intro paragraph.")
+        .bullets(["", "First item", "Second item"])
+        .bullets([])
+        .admonition("note", "Empty", ())
+        .admonition("tip", "Fast Path", ("Zero sibling imports",))
+        .raw(None)
+        .raw("   ")
+        .raw("> Blockquote")
+        .table(("A", "B"), ())
+        .table(
+            ("Col A", "Col B"),
+            [("x|y\nz", "42")],
+            title="Metrics",
+            alignments=("left", "right"),
+            escape_cells=True,
+        )
+        .positional_table(())
+        .option_table(())
+        .command_table(())
+        .rule()
+    )
+    rendered = str(writer)
+    assert rendered == writer.render()
+    assert rendered.startswith("---\nname: demo\ndescription: Line 1 Line 2\n---")
+    assert "## Section" in rendered
+    assert "- First item\n- Second item" in rendered
+    assert '!!! tip "Fast Path"\n    Zero sibling imports' in rendered
+    assert '!!! note "Empty"' not in rendered
+    assert "> Blockquote" in rendered
+    assert "**Metrics**\n\n| Col A | Col B |\n| :--- | ---: |\n| x\\|y z | 42 |" in rendered
+    assert rendered.endswith("\n\n---")
+
+
+def test_boxed_help_panels_arg_groups_and_box_primitive(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify BoxStyle, Colors.box/display_width/wrap_ansi, Arg(group=...), and agent/dumb auto-unboxing."""
+    monkeypatch.delenv("CLIO_AGENT", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(Colors, "ENABLED", True)
+
+    # 1. Unicode East-Asian / emoji display width & ANSI-preserving wrap/slice
+    assert Colors.display_width("\x1b[1;36m💬 Commands\x1b[0m") == 11
+    assert Colors.display_width("e\u0301\x07") == 1  # combining acute + control bell = 0 extra cells
+    styled_long = Colors.cyan("A" * 28, bold=True) + " " + Colors.muted("[env: MY_LONG_VAR]")
+    wrapped = Colors.wrap_ansi(styled_long, 20)
+    assert len(wrapped) >= 3
+    assert all(Colors.display_width(ln) <= 20 for ln in wrapped)
+    assert any("[env: MY_LONG_VAR]" in Colors.strip_ansi(ln) for ln in wrapped)
+    assert Colors.wrap_ansi("", 20) == [""]
+    assert Colors.wrap_ansi("line1\n\nline2", 20) == ["line1", "", "line2"]
+
+    # 2. Colors.box presets, alignments, title truncation, and exact uniform column widths
+    for preset in (BoxStyle.ROUNDED, BoxStyle.SQUARE, BoxStyle.HEAVY, BoxStyle.DOUBLE, BoxStyle.ASCII):
+        for align in ("left", "center", "right"):
+            panel = Colors.box(
+                [Colors.green("ready"), "🌎 status ok"],
+                title="Very Long Panel Header Title",
+                width=24,
+                box_style=preset,
+                border_style=Style(fg=Colors.CYAN, dim=True),
+                title_style=Style(fg=Colors.CYAN, bold=True),
+                align=align,
+            )
+            widths = {Colors.display_width(ln) for ln in panel.splitlines()}
+            assert widths == {24}
+
+    auto_panel = Colors.box("Auto-sized content", title="Info", max_width=60)
+    assert len({Colors.display_width(ln) for ln in auto_panel.splitlines()}) == 1
+    plain_box = Colors.box("No title box")
+    assert plain_box.startswith("╭─")
+
+    # 3. Arg(group=...) merge + boxed multi-column `--help` and grouped `--help-md`
+    base_net = Arg(short="-p", group="Network")
+    merged_net = base_net.merge(Arg(env="APP_PORT"))
+    assert merged_net.group == "Network"
+    assert merged_net.short_flags == ("-p",)
+    assert merged_net.env == "APP_PORT"
+
+    def deploy_cluster(
+        bundle: Path,
+        region: Annotated[str, Arg(group="Target")],
+        host: Annotated[str, Arg(short="-H", group="Network")],
+        port: Annotated[int, Arg(short="-p", env="APP_PORT", group="Network")] = 8443,
+        token: Annotated[str, Arg(env="API_TOKEN", group="Auth", positional=False)] = "",
+        mode: Literal["rolling", "canary"] = "rolling",
+        dry_check: bool = False,
+        labels: dict[str, str] = {},  # noqa: B006
+        tags: list[int] = [],  # noqa: B006
+        coords: tuple[float, float] = (0.0, 0.0),
+    ) -> dict[str, Any]:
+        """Deploy an artifact bundle to a remote cluster.
+
+        Args:
+            bundle: Local bundle archive path.
+            region: Target deployment region.
+            host: Remote cluster hostname.
+            port: Remote HTTPS port.
+            token: Bearer authentication token.
+            mode: Rollout strategy.
+            dry_check: Run preflight validation only.
+            labels: Extra key=value metadata labels.
+            tags: Numeric build tags.
+            coords: Deployment coordinates.
+        """
+        return {"bundle": str(bundle), "region": region, "host": host, "port": port, "mode": mode}
+
+    app = Cli(
+        prog="deployctl",
+        version="2.0.0",
+        command=deploy_cluster,
+        formatter=HelpFormatter(max_width=88),
+        enable_agent_flags=True,
+    )
+
+    boxed_help = Colors.strip_ansi(app.format_help())
+    assert "╭─ Positional arguments " in boxed_help
+    assert "╭─ Options " in boxed_help
+    assert "╭─ Target " in boxed_help
+    assert "╭─ Network " in boxed_help
+    assert "╭─ Auth " in boxed_help
+    assert "╭─ 🌎 Global options " in boxed_help
+    assert "╭─ 🤖 Agent options " in boxed_help
+    assert "{rolling|canary}" in boxed_help
+    assert "KEY=VAL" in boxed_help
+    assert "INT..." in boxed_help
+    assert "FLOAT FLOAT" in boxed_help
+
+    # Every panel line in boxed_help must share the exact same terminal display width!
+    panel_lines = [ln for ln in app.format_help().splitlines() if Colors.strip_ansi(ln).startswith(("╭", "│", "╰"))]
+    assert len(panel_lines) > 15
+    assert len({Colors.display_width(ln) for ln in panel_lines}) == 1
+
+    # Grouped Markdown tables in `--help-md` (positional-only group, option-only group, mixed group)
+    def mixed_group_fn(
+        endpoint: Annotated[str, Arg(group="Connection")],
+        timeout: Annotated[float, Arg(short="-t", group="Connection")] = 5.0,
+    ) -> None:
+        """Test mixed positional and option group in Markdown."""
+
+    md_deploy = app.to_markdown()
+    assert "**Positional Arguments**" in md_deploy
+    assert "**Options**" in md_deploy
+    assert "**Target**" in md_deploy
+    assert "**Network**" in md_deploy
+    assert "**Auth**" in md_deploy
+
+    md_mixed = Cli(prog="mix", command=mixed_group_fn).to_markdown()
+    assert "**Connection**" in md_mixed
+    assert "| Parameter | Type / Choices | Default | Description |" in md_mixed
+
+    # 4. Auto-degradation to unboxed help & unboxed parse error under CLIO_AGENT=1, TERM=dumb, or boxed=False
+    monkeypatch.setenv("CLIO_AGENT", "1")
+    agent_help = Colors.strip_ansi(app.format_help())
+    assert "╭─" not in agent_help
+    assert "Network:" in agent_help
+
+    monkeypatch.delenv("CLIO_AGENT", raising=False)
+    monkeypatch.setenv("TERM", "dumb")
+    dumb_help = Colors.strip_ansi(app.format_help())
+    assert "╭─" not in dumb_help
+    assert "Options:" in dumb_help
+
+    monkeypatch.setenv("TERM", "xterm-256color")
+    unboxed_app = Cli(
+        prog="deployctl",
+        command=deploy_cluster,
+        formatter=HelpFormatter(boxed=False, show_types=False),
+    )
+    unboxed_help = Colors.strip_ansi(unboxed_app.format_help())
+    assert "╭─" not in unboxed_help
+    assert "{rolling|canary}" not in unboxed_help
+
+    with pytest.raises(SystemExit) as err_exc:
+        unboxed_app.run(["bundle.tar", "us-east", "--hos", "api.internal"])
+    assert err_exc.value.code == 2
+    unboxed_err = Colors.strip_ansi(capsys.readouterr().err)
+    assert "╭─ Error" not in unboxed_err
+    assert "Did you mean '--host'?" in unboxed_err

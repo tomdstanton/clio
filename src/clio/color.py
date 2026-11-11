@@ -1,8 +1,10 @@
 import os
 import re
 import sys
+import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import ClassVar, Self
+from typing import ClassVar, Literal, Self
 
 
 def _detect_color_support() -> bool:
@@ -116,6 +118,40 @@ class Style:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class BoxStyle:
+    r"""Immutable border glyph specification for terminal panels rendered by [`Colors.box`][clio.color.Colors.box].
+
+    Attributes:
+        top_left (str): Top-left corner character.
+        top_right (str): Top-right corner character.
+        bottom_left (str): Bottom-left corner character.
+        bottom_right (str): Bottom-right corner character.
+        horizontal (str): Horizontal top/bottom border character.
+        vertical (str): Vertical left/right border character.
+    """
+
+    top_left: str = "╭"
+    top_right: str = "╮"
+    bottom_left: str = "╰"
+    bottom_right: str = "╯"
+    horizontal: str = "─"
+    vertical: str = "│"
+
+    ROUNDED: ClassVar[BoxStyle]
+    SQUARE: ClassVar[BoxStyle]
+    HEAVY: ClassVar[BoxStyle]
+    DOUBLE: ClassVar[BoxStyle]
+    ASCII: ClassVar[BoxStyle]
+
+
+BoxStyle.ROUNDED = BoxStyle("╭", "╮", "╰", "╯", "─", "│")
+BoxStyle.SQUARE = BoxStyle("┌", "┐", "└", "┘", "─", "│")
+BoxStyle.HEAVY = BoxStyle("┏", "┓", "┗", "┛", "━", "┃")
+BoxStyle.DOUBLE = BoxStyle("╔", "╗", "╚", "╝", "═", "║")
+BoxStyle.ASCII = BoxStyle("+", "+", "+", "+", "-", "|")
+
+
 class Colors:
     r"""Namespace for ANSI terminal color escape sequences and styling helpers.
 
@@ -139,6 +175,9 @@ class Colors:
     ENABLED: ClassVar[bool] = _detect_color_support()
 
     _ANSI_RE: ClassVar[re.Pattern[str]] = re.compile(r"\x1b\[[0-9;]*m")
+    _WRAP_TOKEN_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:\x1b\[[0-9;]*m)*(?<!\x1b)\[[^\n\]]+\](?:\x1b\[[0-9;]*m)*|\S+|\s+"
+    )
 
     def __init__(self) -> None:
         r"""Prevent instantiation of namespace class.
@@ -407,6 +446,228 @@ class Colors:
             int: Visible character count.
         """
         return len(cls.strip_ansi(text))
+
+    @staticmethod
+    def _char_width(ch: str) -> int:
+        r"""Return terminal column width (`0`, `1`, or `2`) of a single Unicode character."""
+        cp = ord(ch)
+        if cp < 32 or 0x7F <= cp < 0xA0:
+            return 0
+        if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+            return 0
+        if unicodedata.east_asian_width(ch) in ("W", "F"):
+            return 2
+        return 1
+
+    @classmethod
+    def display_width(cls, text: str) -> int:
+        r"""Compute terminal column width of `text`, ignoring ANSI codes and counting wide/emoji glyphs as 2 cells.
+
+        Args:
+            text (str): Input string potentially containing ANSI sequences or wide Unicode characters.
+
+        Returns:
+            int: Visual column width in a terminal grid.
+        """
+        plain = cls.strip_ansi(text)
+        if plain.isascii():
+            return len(plain)
+        return sum(cls._char_width(ch) for ch in plain)
+
+    @classmethod
+    def _hard_slice_ansi(cls, token: str, width: int, active_sgr: str) -> tuple[list[str], str]:
+        r"""Slice an overlong unbroken token into chunks of at most `width` display columns while preserving SGR state."""
+        chunks: list[str] = []
+        buf: list[str] = [active_sgr] if active_sgr else []
+        cur_w = 0
+        i = 0
+        n = len(token)
+        while i < n:
+            if token[i] == "\033" and i + 1 < n and token[i + 1] == "[":
+                m = cls._ANSI_RE.match(token, i)
+                if m is not None:
+                    seq = m.group(0)
+                    buf.append(seq)
+                    active_sgr = "" if seq in ("\033[0m", "\033[m") else f"{active_sgr}{seq}"
+                    i = m.end()
+                    continue
+            ch = token[i]
+            cw = 1 if ch.isascii() else cls._char_width(ch)
+            if cur_w + cw > width and cur_w > 0:
+                if active_sgr:
+                    buf.append(cls.RESET)
+                chunks.append("".join(buf))
+                buf = [active_sgr] if active_sgr else []
+                cur_w = 0
+            buf.append(ch)
+            cur_w += cw
+            i += 1
+        if cur_w > 0 or not chunks:
+            chunks.append("".join(buf))
+        return chunks, active_sgr
+
+    @classmethod
+    def wrap_ansi(cls, text: str, width: int) -> list[str]:
+        r"""Word-wrap `text` to `width` terminal columns while preserving ANSI escape state across line breaks.
+
+        Keeps bracketed metadata hints (such as `[env: VAR]` and `[default: 4]`) together on a single line
+        whenever `width` permits.
+
+        Args:
+            text (str): Single- or multi-line string potentially containing ANSI sequences.
+            width (int): Maximum terminal display columns per wrapped line.
+
+        Returns:
+            list[str]: Wrapped lines, each with `display_width(line) <= max(1, width)`.
+        """
+        max_w = max(1, width)
+        raw_paragraphs = text.splitlines() if text else [""]
+        if not raw_paragraphs:
+            return [""]
+
+        out: list[str] = []
+        for para in raw_paragraphs:
+            if not para:
+                out.append("")
+                continue
+            if cls.display_width(para) <= max_w:
+                out.append(para)
+                continue
+
+            active_sgr = ""
+            cur_parts: list[str] = []
+            cur_w = 0
+            pending_space = ""
+
+            for tok in cls._WRAP_TOKEN_RE.findall(para):
+                if tok.isspace():
+                    if cur_w > 0:
+                        pending_space = " "
+                    continue
+
+                tok_w = cls.display_width(tok)
+                space_w = 1 if (pending_space and cur_w > 0) else 0
+
+                if cur_w > 0 and cur_w + space_w + tok_w > max_w:
+                    if active_sgr:
+                        cur_parts.append(cls.RESET)
+                    out.append("".join(cur_parts))
+                    cur_parts = [active_sgr] if active_sgr else []
+                    cur_w = 0
+                    pending_space = ""
+                    space_w = 0
+
+                if tok_w > max_w:
+                    pieces, active_sgr = cls._hard_slice_ansi(tok, max_w, active_sgr)
+                    out.extend(pieces[:-1])
+                    cur_parts = [pieces[-1]]
+                    cur_w = cls.display_width(pieces[-1])
+                    pending_space = ""
+                    continue
+
+                if space_w:
+                    cur_parts.append(" ")
+                    cur_w += 1
+                cur_parts.append(tok)
+                cur_w += tok_w
+                pending_space = ""
+                for sgr in cls._ANSI_RE.findall(tok):
+                    active_sgr = "" if sgr in ("\033[0m", "\033[m") else f"{active_sgr}{sgr}"
+
+            if cur_parts:
+                out.append("".join(cur_parts))
+
+        return out or [""]
+
+    @classmethod
+    def box(
+        cls,
+        content: str | Sequence[str],
+        *,
+        title: str = "",
+        width: int | None = None,
+        max_width: int = 100,
+        padding: int = 1,
+        box_style: BoxStyle = BoxStyle.ROUNDED,
+        border_style: Style | None = None,
+        title_style: Style | None = None,
+        align: Literal["left", "center", "right"] = "left",
+    ) -> str:
+        r"""Render `content` inside a framed Unicode or ASCII terminal box.
+
+        Args:
+            content (str | Sequence[str]): Body string or sequence of pre-formatted lines.
+            title (str): Optional title embedded in the top border (`╭─ Title ───╮`).
+            width (int | None): Explicit outer column width. When `None`, fits content up to `max_width`.
+            max_width (int): Maximum outer column width when `width` is `None`.
+            padding (int): Horizontal space padding inside left and right borders.
+            box_style (BoxStyle): Border glyph preset (`BoxStyle.ROUNDED`, `SQUARE`, `HEAVY`, `DOUBLE`, `ASCII`).
+            border_style (Style | None): Optional `Style` applied to border glyphs.
+            title_style (Style | None): Optional `Style` applied to `title`.
+            align (Literal["left", "center", "right"]): Horizontal alignment of each row inside the box.
+
+        Returns:
+            str: Framed multi-line panel string (without a trailing newline).
+        """
+        raw_lines = (content.splitlines() or [""]) if isinstance(content, str) else (list(content) or [""])
+        pad = max(0, padding)
+        min_outer = max(10, 2 + 2 * pad + 4)
+
+        if width is not None:
+            outer_w = max(min_outer, width)
+        else:
+            content_w = max((cls.display_width(ln) for ln in raw_lines), default=0) + 2 + 2 * pad
+            title_w = (cls.display_width(title) + 6) if title else 0
+            outer_w = min(max(min_outer, max_width), max(min_outer, content_w, title_w))
+
+        inner_w = outer_w - 2
+        text_w = max(1, inner_w - 2 * pad)
+        b_fn = border_style if border_style is not None else (lambda s: s)
+
+        if title:
+            plain_title = cls.strip_ansi(title).strip()
+            title_vis = cls.display_width(plain_title)
+            max_title_w = max(1, inner_w - 4)
+            if title_vis > max_title_w:
+                trimmed: list[str] = []
+                acc = 0
+                for ch in plain_title:
+                    cw = cls._char_width(ch)
+                    if acc + cw > max_title_w - 1:
+                        break
+                    trimmed.append(ch)
+                    acc += cw
+                plain_title = "".join(trimmed) + "…"
+                title_vis = cls.display_width(plain_title)
+            styled_title = title_style(plain_title) if title_style is not None else plain_title
+            rem = max(1, inner_w - title_vis - 3)
+            top_line = (
+                f"{b_fn(box_style.top_left + box_style.horizontal)} "
+                f"{styled_title} "
+                f"{b_fn(box_style.horizontal * rem + box_style.top_right)}"
+            )
+        else:
+            top_line = b_fn(f"{box_style.top_left}{box_style.horizontal * inner_w}{box_style.top_right}")
+
+        v_glyph = b_fn(box_style.vertical)
+        pad_str = " " * pad
+        rows: list[str] = [top_line]
+
+        for raw_ln in raw_lines:
+            for wrapped_ln in cls.wrap_ansi(raw_ln, text_w):
+                vis = cls.display_width(wrapped_ln)
+                extra = max(0, text_w - vis)
+                if align == "left":
+                    cell = f"{wrapped_ln}{' ' * extra}"
+                elif align == "right":
+                    cell = f"{' ' * extra}{wrapped_ln}"
+                else:
+                    left_pad = extra // 2
+                    cell = f"{' ' * left_pad}{wrapped_ln}{' ' * (extra - left_pad)}"
+                rows.append(f"{v_glyph}{pad_str}{cell}{pad_str}{v_glyph}")
+
+        rows.append(b_fn(f"{box_style.bottom_left}{box_style.horizontal * inner_w}{box_style.bottom_right}"))
+        return "\n".join(rows)
 
     # --- Ergonomic Style & Color Helpers ---
     @classmethod

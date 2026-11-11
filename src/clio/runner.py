@@ -523,11 +523,22 @@ def _emit_runner_error(
             sys.stderr.write(f"did you mean: {', '.join(suggestions)}\n")
         sys.exit(err.exit_code)
 
-    sys.stderr.write(f"{Colors.style('Error:', fg=Colors.RED, bold=True)} {err}\n")
+    styled_usage = formatter.format_usage(
+        "clio",
+        positionals=_RUNNER_POSITIONALS,
+        has_options=True,
+        has_subcommands=False,
+    ).rstrip("\n")
+    hint_text = Colors.muted("Try 'clio --help' for help.")
+    if formatter.should_box(agent_mode=False):
+        panel = formatter.format_error_box(str(err), suggestions=suggestions)
+        sys.stderr.write(f"{styled_usage}\n{hint_text}\n\n{panel}\n")
+        sys.exit(err.exit_code)
+
+    sys.stderr.write(f"{styled_usage}\n{hint_text}\n\n{Colors.style('Error:', fg=Colors.RED, bold=True)} {err}\n")
     if suggestions:
         styled = ", ".join(Colors.style(s, fg=Colors.CYAN, bold=True) for s in suggestions)
         sys.stderr.write(f"Did you mean: {styled}?\n")
-    sys.stderr.write(f"\n{usage}\n")
     sys.exit(err.exit_code)
 
 

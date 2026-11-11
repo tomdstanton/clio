@@ -55,3 +55,9 @@ Complete API reference for `clio`, rendered via `mkdocstrings[python]`.
 ## Zero-Edit Target Runner (`clio.runner`)
 
 ::: clio.runner
+
+---
+
+## GitHub-Flavored Markdown Builder (`clio.markdown`)
+
+::: clio.markdown

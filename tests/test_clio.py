@@ -66,6 +66,11 @@ type TaggedValues[T] = Annotated[list[T], Arg(short="-t", help="Tagged items")]
 
 
 # Fixtures & Helper Commands -------------------------------------------------------------------------------------------
+def _reflow_help(text: str) -> str:
+    r"""Collapse ANSI escapes, Unicode box borders, and wrapped whitespace into single-spaced prose."""
+    return " ".join(Colors.strip_ansi(text).replace("│", " ").split())
+
+
 class CustomDomainError(Exception):
     r"""Dummy domain exception for testing `catch_exceptions`."""
 
@@ -474,8 +479,9 @@ def test_command_auto_introspects_call_signature_and_types(
     cli = Cli(prog="mytool", commands=[cmd])
 
     help_text = cmd.format_help(prog_prefix="mytool")
-    assert "Path to input file." in help_text
-    assert "Execution mode selector." in help_text
+    reflowed_help = _reflow_help(help_text)
+    assert "Path to input file." in reflowed_help
+    assert "Execution mode selector." in reflowed_help
     assert "--no-cache" in help_text
     assert "--no-dry-run" not in help_text  # Default is False, so --no-dry-run is hidden in help
 
@@ -535,10 +541,11 @@ def test_annotated_short_flags_and_docstring_help_backfill(
     cli = Cli(prog="mytool", commands=[cmd])
 
     help_out = cmd.format_help(prog_prefix="mytool")
+    reflowed_out = _reflow_help(help_out)
     assert "--name" in help_out and "-n" in help_out
-    assert "Documented name help from docstring." in help_out
+    assert "Documented name help from docstring." in reflowed_out
     assert "--retries" in help_out
-    assert "Number of retry attempts." in help_out
+    assert "Number of retry attempts." in reflowed_out
 
     cli.run(["hybrid", "-n", "custom", "--retries", "5"])
     assert captured == {"name": "custom", "retries": 5}
@@ -747,10 +754,13 @@ def test_pep649_lazy_annotate_preserved_across_registration_help_and_routing(
     cli = Cli(prog="lazytool", commands=[UntouchedTrackedCmd, SafeNeighborCmd])
     assert annotate_evals == 0
 
-    # 2. Root --help rendering must NOT evaluate UntouchedTrackedCmd.__call__.__annotate__
+    # 2. Root --help rendering (including 80-column CI boxed wrapping) must NOT evaluate __annotate__
+    monkeypatch.delenv("CLIO_AGENT", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLUMNS", "80")
     help_text = cli.format_help()
     assert "tracked (tr)" in help_text
-    assert "Command whose PEP 649 __annotate__ tracks evaluation count." in help_text
+    assert "Command whose PEP 649 __annotate__ tracks evaluation count." in _reflow_help(help_text)
     assert annotate_evals == 0
 
     # 3. Routing and running a sibling command must NOT evaluate UntouchedTrackedCmd.__call__.__annotate__
@@ -1976,7 +1986,7 @@ def test_plain_functions_first_class_cli_and_lazy_annotations(
     assert broken_evals == 0
     root_help = cli.format_help()
     assert "run_step" in root_help
-    assert "Run synchronous optimization step." in root_help
+    assert "Run synchronous optimization step." in _reflow_help(root_help)
     assert broken_evals == 0
 
     # Both `run_step` and automatic kebab-case alias `run-step` route in O(1) without touching broken_sibling
@@ -2124,26 +2134,29 @@ if __name__ == "__main__":
         encoding="utf-8",
     )
 
-    # 2a. Single-function `--dry-run --json` and live `--json` via `runner_main`
-    dry_res = runner_main([f"{ext_script}:summarize_records", "--dry-run", "--json", "data.csv", "--limit", "10"])
-    assert isinstance(dry_res, AgentResult)
-    assert dry_res.dry_run is True
-    assert dry_res.arguments == {"input_path": Path("data.csv"), "limit": 10, "shout": False}
+    # 2a. Single-function `--dry-run --json`, live `--json`, and plain stdout via `runner_main` (`sys.exit(main())`-safe)
+    assert runner_main([f"{ext_script}:summarize_records", "--dry-run", "--json", "data.csv", "--limit", "10"]) is None
     dry_stdout = json.loads(capsys.readouterr().out)
     assert dry_stdout["ok"] is True and dry_stdout["command"] == "summarize_records"
+    assert dry_stdout["dry_run"] is True
+    assert dry_stdout["arguments"] == {"input_path": "data.csv", "limit": 10, "shout": False}
 
-    live_res = runner_main([f"{ext_script}:summarize_records", "--json", "notes.txt", "--shout"])
-    assert isinstance(live_res, AgentResult)
-    assert live_res.result == {"label": "NOTES.TXT", "limit": 5}
-    capsys.readouterr()
+    assert runner_main([f"{ext_script}:summarize_records", "--json", "notes.txt", "--shout"]) is None
+    live_stdout = json.loads(capsys.readouterr().out)
+    assert live_stdout["result"] == {"label": "NOTES.TXT", "limit": 5}
+
+    assert runner_main([f"{ext_script}:summarize_records", "notes.txt", "--shout"]) is None
+    assert json.loads(capsys.readouterr().out) == {"label": "NOTES.TXT", "limit": 5}
+
+    assert runner_main([f"{ext_script}:ZeroArgCallable", "--factor", "3"]) is None
+    assert capsys.readouterr().out.strip() == "63"
 
     # 2b. Async target via `run_target` and `run_target_async`
     assert run_target(f"{ext_script}:async_pipeline", ["ab", "cd", "--multiplier", "3"]) == ["ababab", "cdcdcd"]
     assert asyncio.run(run_target_async(f"{ext_script}:async_pipeline", ["x", "--multiplier", "4"])) == ["xxxx"]
 
     # 2c. Non-callable `@dataclass` target hydrated directly via `:ModelHyperParams`
-    hp_res = runner_main([f"{ext_script}:ModelHyperParams", "--lr", "0.02", "--json"])
-    assert isinstance(hp_res, AgentResult)
+    assert runner_main([f"{ext_script}:ModelHyperParams", "--lr", "0.02", "--json"]) is None
     assert json.loads(capsys.readouterr().out)["result"] == {"lr": 0.02, "layers": 12}
 
     # 2d. Zero-arg callable class works; non-callable / required-init / constant targets raise clean CliError
@@ -2209,9 +2222,8 @@ if __name__ == "__main__":
         "app = Cli(prog='prebuilt', commands=[greet], enable_agent_flags=False)\n",
         encoding="utf-8",
     )
-    upgraded = runner_main([str(app_file), "greet", "--who", "tom", "--json"])
-    assert isinstance(upgraded, AgentResult) and upgraded.result == "hi tom"
-    capsys.readouterr()
+    assert runner_main([str(app_file), "greet", "--who", "tom", "--json"]) is None
+    assert json.loads(capsys.readouterr().out)["result"] == "hi tom"
 
     # 5. Runner CLI top-level flags (`clio`, `--help`, `--version`, unknown flag, fuzzy symbol typo, `python -m clio`)
     assert runner_main([]) is None

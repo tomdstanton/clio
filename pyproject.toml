@@ -1,5 +1,5 @@
 [project]
-name = "clio"
+name = "pyclio"
 dynamic = ["version"]
 description = "Lightweight, zero-dependency, agent-native CLI framework for Python 3.14+."
 readme = "README.md"

@@ -2,6 +2,7 @@ import dataclasses
 import importlib
 import importlib.util
 import inspect
+import json
 import os
 import sys
 import types
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
 
-from clio.agent import AgentErrorSpec, AgentResult, _detect_agent_mode
+from clio.agent import AgentErrorSpec, AgentResult, _detect_agent_mode, serialize_for_json
 from clio.cli import Cli, PackageMeta, _has_unquoted_json_flag
 from clio.color import Colors
 from clio.command import BaseCommand, Command, CommandTarget
@@ -542,14 +543,14 @@ def _emit_runner_error(
     sys.exit(err.exit_code)
 
 
-def main(argv: Sequence[str] | None = None) -> Any:
+def main(argv: Sequence[str] | None = None) -> None:
     r"""Entrypoint for `python -m clio`, `uv run -m clio`, and the `clio` console script.
+
+    Returns `None` on success so console-script wrappers (`sys.exit(main())`) exit with status 0
+    instead of treating non-integer return values as failure messages on stderr.
 
     Args:
         argv (Sequence[str] | None): CLI tokens excluding `sys.argv[0]`. Defaults to `sys.argv[1:]`.
-
-    Returns:
-        Any: Result of target execution, or `None` when invoked with no arguments.
     """
     tokens = list(sys.argv[1:] if argv is None else argv)
     if not tokens:
@@ -586,4 +587,11 @@ def main(argv: Sequence[str] | None = None) -> Any:
         _emit_runner_error(err, command_label=target_raw, json_requested=json_req)
         raise AssertionError("unreachable") from err  # pragma: no cover
 
-    return cli.run(target_args)
+    result = cli.run(target_args)
+    if result is not None and not isinstance(result, AgentResult):
+        serialized = serialize_for_json(result)
+        if isinstance(serialized, (dict, list)):
+            print(json.dumps(serialized, indent=2))
+        else:
+            print(serialized)
+    return None

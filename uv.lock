@@ -52,74 +52,6 @@ wheels = [
 ]
 
 [[package]]
-name = "clio"
-source = { editable = "." }
-
-[package.dev-dependencies]
-dev = [
-    { name = "mkdocstrings", extra = ["python"] },
-    { name = "prek" },
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "pytest-testmon" },
-    { name = "pytest-xdist" },
-    { name = "ruff" },
-    { name = "ty" },
-    { name = "zensical" },
-    { name = "zenzic" },
-]
-docs = [
-    { name = "mkdocstrings", extra = ["python"] },
-    { name = "zensical" },
-    { name = "zenzic" },
-]
-lint = [
-    { name = "prek" },
-    { name = "ruff" },
-]
-test = [
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "pytest-testmon" },
-    { name = "pytest-xdist" },
-]
-typing = [
-    { name = "ty" },
-]
-
-[package.metadata]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mkdocstrings", extras = ["python"] },
-    { name = "prek" },
-    { name = "pytest", specifier = ">=8.0.0" },
-    { name = "pytest-cov", specifier = ">=7.1.0" },
-    { name = "pytest-testmon", specifier = ">=2.1.0" },
-    { name = "pytest-xdist" },
-    { name = "ruff" },
-    { name = "ty" },
-    { name = "zensical", specifier = ">=0.0.46" },
-    { name = "zenzic", specifier = ">=0.30.0" },
-]
-docs = [
-    { name = "mkdocstrings", extras = ["python"] },
-    { name = "zensical", specifier = ">=0.0.46" },
-    { name = "zenzic", specifier = ">=0.30.0" },
-]
-lint = [
-    { name = "prek" },
-    { name = "ruff" },
-]
-test = [
-    { name = "pytest", specifier = ">=8.0.0" },
-    { name = "pytest-cov", specifier = ">=7.1.0" },
-    { name = "pytest-testmon", specifier = ">=2.1.0" },
-    { name = "pytest-xdist" },
-]
-typing = [{ name = "ty" }]
-
-[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -579,6 +511,74 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/47/be/591e35f0a3bc57d8cad3a23ec4dcbe69ceb65146ff93c00a7560cf6fd751/prek-0.5.10-py3-none-win_amd64.whl", hash = "sha256:175ef58e5aab13e6d6a1a41409ed011dfae62bc60180b227bb7192803e980010", size = 5470434, upload-time = "2026-11-04T01:47:52.268Z" },
     { url = "https://files.pythonhosted.org/packages/7f/af/06a905c3b341adb7838498b39157ef2079ecd11079c40d4265e6d14c70d6/prek-0.5.10-py3-none-win_arm64.whl", hash = "sha256:e689633358ec7c0e3dd3d0d9bce55613a9f78fc31ce3b4a16cdce70bb1d1d47a", size = 5410984, upload-time = "2026-11-04T01:47:53.978Z" },
 ]
+
+[[package]]
+name = "pyclio"
+source = { editable = "." }
+
+[package.dev-dependencies]
+dev = [
+    { name = "mkdocstrings", extra = ["python"] },
+    { name = "prek" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "pytest-testmon" },
+    { name = "pytest-xdist" },
+    { name = "ruff" },
+    { name = "ty" },
+    { name = "zensical" },
+    { name = "zenzic" },
+]
+docs = [
+    { name = "mkdocstrings", extra = ["python"] },
+    { name = "zensical" },
+    { name = "zenzic" },
+]
+lint = [
+    { name = "prek" },
+    { name = "ruff" },
+]
+test = [
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "pytest-testmon" },
+    { name = "pytest-xdist" },
+]
+typing = [
+    { name = "ty" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "mkdocstrings", extras = ["python"] },
+    { name = "prek" },
+    { name = "pytest", specifier = ">=8.0.0" },
+    { name = "pytest-cov", specifier = ">=7.1.0" },
+    { name = "pytest-testmon", specifier = ">=2.1.0" },
+    { name = "pytest-xdist" },
+    { name = "ruff" },
+    { name = "ty" },
+    { name = "zensical", specifier = ">=0.0.46" },
+    { name = "zenzic", specifier = ">=0.30.0" },
+]
+docs = [
+    { name = "mkdocstrings", extras = ["python"] },
+    { name = "zensical", specifier = ">=0.0.46" },
+    { name = "zenzic", specifier = ">=0.30.0" },
+]
+lint = [
+    { name = "prek" },
+    { name = "ruff" },
+]
+test = [
+    { name = "pytest", specifier = ">=8.0.0" },
+    { name = "pytest-cov", specifier = ">=7.1.0" },
+    { name = "pytest-testmon", specifier = ">=2.1.0" },
+    { name = "pytest-xdist" },
+]
+typing = [{ name = "ty" }]
 
 [[package]]
 name = "pydantic"

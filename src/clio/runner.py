@@ -563,7 +563,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.exit(0)
 
     if first in ("-v", "--version"):
-        pkg_meta = PackageMeta.resolve("clio")
+        pkg_meta = PackageMeta.resolve("pyclio") or PackageMeta.resolve("clio")
         ver = (pkg_meta.version if pkg_meta is not None else "") or "0.0.0"
         print(f"clio {ver}")
         sys.exit(0)

@@ -699,6 +699,7 @@ def test_zero_dependency_markdown_documentation_generation() -> None:
 
 def test_importlib_metadata_auto_populates_cli(
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = Cli.from_package("pytest", commands=[LeafCommand])
     assert app.config.prog == "pytest"
@@ -715,6 +716,17 @@ def test_importlib_metadata_auto_populates_cli(
 
     assert PackageMeta.resolve("nonexistent-package-xyz-999") is None
     assert PackageMeta.resolve("") is None
+    clio_meta = PackageMeta.resolve("pyclio")
+    assert isinstance(clio_meta, PackageMeta)
+    assert clio_meta.name == "pyclio"
+
+    import importlib.metadata
+
+    PackageMeta._CACHE.pop("clio_import_alias", None)
+    monkeypatch.setattr(importlib.metadata, "packages_distributions", lambda: {"clio_import_alias": ["pyclio"]})
+    alias_meta = PackageMeta.resolve("clio_import_alias")
+    assert isinstance(alias_meta, PackageMeta)
+    assert alias_meta.name == "pyclio"
 
 
 # 7. Python 3.14 annotationlib, PEP 649 Lazy __annotate__ & PEP 695 Type Aliases --------------------------------------

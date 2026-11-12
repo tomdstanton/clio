@@ -72,8 +72,15 @@ class PackageMeta:
         try:
             meta = importlib.metadata.metadata(package)
         except importlib.metadata.PackageNotFoundError:
-            cls._CACHE[package] = None
-            return None
+            dists = importlib.metadata.packages_distributions().get(package)
+            if not dists:
+                cls._CACHE[package] = None
+                return None
+            try:
+                meta = importlib.metadata.metadata(dists[0])
+            except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+                cls._CACHE[package] = None
+                return None
 
         urls: dict[str, str] = {}
         for raw_url in meta.get_all("Project-URL") or ():

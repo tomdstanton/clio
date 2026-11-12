@@ -54,6 +54,9 @@ source = "vcs"
 [tool.hatch.build.hooks.vcs]
 version-file = "src/clio/_version.py"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/clio"]
+
 [tool.ruff]
 line-length = 120
 force-exclude = true
